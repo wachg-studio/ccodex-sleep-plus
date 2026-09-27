@@ -281,6 +281,8 @@ class Egress:
         self.last_ok = 0.0
         self.last_error = ""
         self.uses = 0
+        self.quality = "unknown"      # healthy / degraded / severely / unknown
+        self.quality_answer = ""
 
     def open_socket(self, dst_host, dst_port, timeout) -> socket.socket:
         if self.kind == "direct":
@@ -368,7 +370,8 @@ class Egress:
             "id": self.id, "label": self.label, "kind": self.kind,
             "addr": f"{self.host}:{self.port}" if self.kind != "direct" else "直连",
             "last_ok": int(self.last_ok), "last_error": self.last_error,
-            "uses": self.uses,
+            "uses": self.uses, "quality": self.quality,
+            "quality_answer": self.quality_answer,
         }
 
 
@@ -528,6 +531,45 @@ class StreamObserver:
             }
 
 
+# 知识新鲜度探针（社区共识做法，来自 tzf1003/csss：答 iPhone 17 = 满血，
+# iPhone 16 = 降智，iPhone 15 = 严重降智。规则会随时间过时，随社区更新。）
+QUALITY_PROBE_ASK = "What is the latest iPhone model? Reply with just the model name."
+QUALITY_PROBE_SYSTEM = ("Answer from your own knowledge only, in a few words, no explanation. "
+                        "Do not use any tools or web search.")
+QUALITY_LABELS = {"healthy": "满血", "degraded": "降智", "severely": "严重降智", "unknown": "未知"}
+
+
+def sse_answer_text(data: bytes) -> str:
+    """拼接 SSE 流里的模型回答文本（delta 优先，completed 全文兜底）。"""
+    parts, full = [], ""
+    for _name, payload in sse_walk(data):
+        try:
+            ev = json.loads(payload)
+        except Exception:
+            continue
+        kind = ev.get("type", "")
+        if kind == "response.output_text.delta":
+            parts.append(ev.get("delta", ""))
+        elif kind == "response.completed":
+            for item in (ev.get("response") or {}).get("output", []):
+                for c in (item or {}).get("content", []):
+                    if (c or {}).get("type") in ("output_text", "text"):
+                        full += c.get("text", "")
+    return ("".join(parts) or full).strip()
+
+
+def judge_quality(answer: str) -> str:
+    t = (answer or "").lower().replace(" ", "")
+    if "iphone17" in t or "17" in t and "iphone" in t:
+        return "healthy"
+    if "iphone16" in t or ("16" in t and "iphone" in t):
+        return "degraded"
+    if "iphone15" in t or ("15" in t and "iphone" in t):
+        return "severely"
+    return "unknown"
+
+
+
 # ---------------------------------------------------------------- 认证与账号 --
 def load_codex_auth():
     try:
@@ -658,7 +700,7 @@ class Engine:
             }
 
         return {"on": agg(groups["on"]), "off": agg(groups["off"]),
-                "note": "对比注入开/关时服务端自报模型与用量；样本少时不足以下结论。"}
+                "note": "对比注入开/关的自报模型与用量；注意社区发现 served 字段可能失真，token 用量更可靠；样本少时不足以下结论。"}
 
     # ---- 持久化 ----
     def _load_sessions(self):
@@ -762,15 +804,16 @@ class Engine:
 
     # ---- 探测 ----
     def probe_once(self, sess: Session, egress: Egress):
-        """发一条极短的生成请求，采集 turn-state。消耗真实额度。"""
+        """发一条极短的知识探针请求：一次请求同时采集 turn-state 并判定出口
+        serving 质量（社区 csss 项目的 iPhone 知识新鲜度法）。消耗真实额度。"""
         headers = dict(sess.headers)
         headers["Content-Type"] = "application/json"
         headers["Accept"] = "text/event-stream"
         body = json.dumps({
             "model": sess.model,
-            "instructions": "Reply with OK.",
+            "instructions": QUALITY_PROBE_SYSTEM,
             "input": [{"type": "message", "role": "user",
-                       "content": [{"type": "input_text", "text": "Reply with OK."}]}],
+                       "content": [{"type": "input_text", "text": QUALITY_PROBE_ASK}]}],
             "stream": True, "store": False, "parallel_tool_calls": True,
             "include": ["reasoning.encrypted_content"],
         }).encode()
@@ -790,6 +833,7 @@ class Engine:
             data = resp.read(1 << 21)
             st = parse_state(state_raw or "")
             completed, failure, fstatus = stream_outcome(data)
+            answer = sse_answer_text(data)
             if failure:
                 return {"ok": False, "status": fstatus or resp.status, "result": failure,
                         "retry_after": 0}
@@ -799,8 +843,11 @@ class Engine:
                 return {"ok": False, "status": resp.status, "result": "missing_state_header"}
             if st is None:
                 return {"ok": False, "status": resp.status, "result": "invalid_state_envelope"}
+            egress.quality = judge_quality(answer)
+            egress.quality_answer = answer[:60]
             return {"ok": True, "status": 200, "state": st,
-                    "shape_ok": st.blocks in self.blocks_for(sess), "blocks": st.blocks}
+                    "shape_ok": st.blocks in self.blocks_for(sess), "blocks": st.blocks,
+                    "quality": egress.quality}
         except OSError as e:
             return {"ok": False, "status": 0, "result": "network_failed", "error": str(e)}
         finally:
@@ -1171,19 +1218,26 @@ class Gateway(BaseHTTPRequestHandler):
                    status=status, headers=extra)
 
     def _key_ok(self):
+        """面板本机访问控制：回环 Host + Sec-Fetch-Site 白名单；key 可选
+        （带了就必须匹配——兼容旧链接；不带也放行，从根上避免'链接过期'）。"""
         q = urllib.parse.urlparse(self.path).query
         key = urllib.parse.parse_qs(q).get("key", [""])[0]
         sec = self.headers.get("Sec-Fetch-Site") or ""
         if sec not in ("", "same-origin", "none"):
+            log("panel_denied", level="warn", reason="sec_fetch_site", value=sec[:32])
             return False
-        return key == PANEL_KEY
+        if key and key != PANEL_KEY:
+            log("panel_denied", level="warn", reason="key_mismatch",
+                key_prefix=key[:6], expect_prefix=PANEL_KEY[:6])
+            return False
+        return True
 
     # ---- 路由 ----
     def do_GET(self):
         path = urllib.parse.urlparse(self.path).path
         if path == "/panel":
             if not self._key_ok():
-                self._fail(403, "bad_key", "面板链接已过期：请从托盘图标右键菜单重新打开面板")
+                self._fail(403, "bad_key", "面板访问受限：请从托盘图标右键菜单重新打开面板")
                 return
             body = PANEL_HTML.encode("utf8")
             self.send_response(200)
@@ -1195,7 +1249,7 @@ class Gateway(BaseHTTPRequestHandler):
             return
         if path == "/panel/api/status":
             if not self._key_ok():
-                self._fail(403, "bad_key", "面板链接已过期：请从托盘图标右键菜单重新打开面板")
+                self._fail(403, "bad_key", "面板访问受限：请从托盘图标右键菜单重新打开面板")
                 return
             self._json(self.engine.status())
             return
@@ -1208,7 +1262,7 @@ class Gateway(BaseHTTPRequestHandler):
         path = urllib.parse.urlparse(self.path).path
         if path == "/panel/api/action":
             if not self._key_ok():
-                self._fail(403, "bad_key", "面板链接已过期：请从托盘图标右键菜单重新打开面板")
+                self._fail(403, "bad_key", "面板访问受限：请从托盘图标右键菜单重新打开面板")
                 return
             self._panel_action()
             return
@@ -1261,6 +1315,22 @@ class Gateway(BaseHTTPRequestHandler):
                 s.store.clear()
             eng.save()
             log("state_cleared")
+            self._json({"ok": True})
+        elif action == "egress_check":
+            sess = self._first_session_or_bootstrap()
+            if not sess:
+                self._json({"ok": False, "error": "没有可用会话（缺少登录凭据）"})
+                return
+
+            def _check_all():
+                for e in eng.egresses:
+                    r = eng.probe_once(sess, e)
+                    log("egress_quality", egress=e.id, ok=r.get("ok"),
+                        quality=e.quality, answer=e.quality_answer)
+                    if r.get("status") in (401, 403, 429):
+                        break
+                eng.save()
+            threading.Thread(target=_check_all, daemon=True).start()
             self._json({"ok": True})
         elif action == "restore_config":
             r = restore_provider()
@@ -1654,8 +1724,11 @@ PANEL_HTML = r"""<!doctype html>
 
     <div class="card fade">
       <h2><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M3 12h18"/><path d="M12 3a15 15 0 0 1 0 18 15 15 0 0 1 0-18z"/></svg>出口路由</h2>
-      <p class="desc">探测与转发使用的网络出口；state 与出口绑定使用。</p>
+      <p class="desc">探测与转发使用的网络出口；state 与出口绑定使用。质量 = 知识探针判定（iPhone 档位）。</p>
       <div id="egresses"></div>
+      <div class="actions">
+        <button id="btn-check"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 3h6l1 4h4v14H4V7h4z"/><circle cx="12" cy="13" r="3"/></svg>出口体检（每出口 1 次请求）</button>
+      </div>
     </div>
 
     <div class="card fade">
@@ -1717,8 +1790,8 @@ function pill(el, text, cls){ el.className = 'pill ' + (cls||''); $(el.id + '-t'
 
 async function poll(){
   try{
-    const r = await fetch('/panel/api/status?key=' + encodeURIComponent(KEY), {cache:'no-store'});
-    if(r.status===403){document.body.innerHTML='<div style="font-family:system-ui;padding:48px;text-align:center;color:#5f6672">面板链接已过期<br><br>请从托盘图标右键菜单重新打开「打开状态面板」</div>';throw new Error(403);}
+    const r = await fetch('/panel/api/status' + (KEY ? '?key=' + encodeURIComponent(KEY) : ''), {cache:'no-store'});
+    if(r.status===403){document.body.innerHTML='<div style="font-family:system-ui;padding:48px;text-align:center;color:#5f6672">面板访问受限<br><br>请从托盘图标右键菜单重新打开「打开状态面板」</div>';throw new Error(403);}
     render(await r.json());
   }catch(e){ pill($('p-gw'), '网关离线', 'bad'); }
   setTimeout(poll, 2000);
@@ -1758,16 +1831,20 @@ function render(s){
   }
   $('btn-toggle-t').textContent = s.injection_enabled ? '关闭注入' : '开启注入';
 
+  const QMAP = {healthy:['满血','ok'], degraded:['降智','err'], severely:['严重降智','err'], unknown:['未测','idle']};
   $('egresses').innerHTML = (s.egresses||[]).map(e=>{
     const tag = e.last_error ? '<span class="tag err">失败</span>'
       : e.last_ok ? '<span class="tag ok">可用</span>'
       : '<span class="tag idle">未使用</span>';
+    const q = QMAP[e.quality] || QMAP.unknown;
+    const qtag = e.quality && e.quality !== 'unknown'
+      ? `<span class="tag ${q[1]}">${q[0]}</span>` : '';
     const using = sess && sess.state.usable && e.id === sess.state_egress
       ? ' <span class="tag use">使用中</span>' : '';
     return `<div class="egress">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M3 12h18"/><path d="M12 3a15 15 0 0 1 0 18 15 15 0 0 1 0-18z"/></svg>
-      <div class="name">${e.label}<small>${e.uses} 次使用${e.last_error ? ' · ' + e.last_error : ''}</small></div>
-      ${tag}${using}</div>`;
+      <div class="name">${e.label}<small>${e.uses} 次使用${e.quality_answer ? ' · 探针答: ' + e.quality_answer : ''}${e.last_error ? ' · ' + e.last_error : ''}</small></div>
+      ${qtag}${tag}${using}</div>`;
   }).join('') || '<p class="desc">未发现出口</p>';
 
   const si = [];
@@ -1810,12 +1887,13 @@ function render(s){
 }
 
 async function act(body){
-  const r = await fetch('/panel/api/action?key=' + encodeURIComponent(KEY),
+  const r = await fetch('/panel/api/action' + (KEY ? '?key=' + encodeURIComponent(KEY) : ''),
     {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)});
   const j = await r.json().catch(()=>({}));
   if(!j.ok && j.error) alert(j.error);
 }
 $('btn-probe').onclick = () => act({action:'probe_now'});
+$('btn-check').onclick = () => { if(confirm('对每个出口发 1 次知识探针（消耗额度）？')) act({action:'egress_check'}); };
 $('btn-toggle').onclick = () => act({action:'toggle_injection'});
 $('btn-clear').onclick = () => { if(confirm('清除已采集的 state？')) act({action:'clear_state'}); };
 $('btn-restore').onclick = () => { if(confirm('恢复 Codex 配置（移除本地网关接管）？')) act({action:'restore_config'}); };
@@ -2237,6 +2315,15 @@ def selftest():
     obs.feed(ev1[:15]); obs.feed(ev1[15:] + ev2[:30]); obs.feed(ev2[30:])
     check("observer model parsed", obs.model == "gpt-6-astra")
     check("observer usage parsed", obs.usage == {"in": 100, "out": 250, "reason": 120})
+
+    check("judge quality healthy", judge_quality("iPhone 17 Pro Max") == "healthy")
+    check("judge quality degraded", judge_quality("The latest is iPhone 16 Pro") == "degraded")
+    check("judge quality severely", judge_quality("iPhone 15") == "severely")
+    check("judge quality unknown", judge_quality("I cannot answer") == "unknown")
+    a1 = sse_answer_text(
+        ('data: {"type":"response.output_text.delta","delta":"iPhone "}' + chr(10) + chr(10)
+         + 'data: {"type":"response.output_text.delta","delta":"17 Pro"}' + chr(10) + chr(10)).encode())
+    check("sse answer delta concat", a1 == "iPhone 17 Pro")
 
     print("selftest", "OK" if ok else "FAILED")
     return ok
