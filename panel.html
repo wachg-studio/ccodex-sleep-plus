@@ -150,6 +150,8 @@
     </button>
   </section>
 
+  <div class="card fade hidden" id="attr-banner" style="margin-bottom:14px"></div>
+
   <section class="stats fade">
     <div class="stat"><div class="lab"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 13c0 5-3.5 7.5-7.66 8.95a1 1 0 0 1-.67-.01C7.5 20.5 4 18 4 13V6a1 1 0 0 1 1-1c2 0 4.5-1.2 6.24-2.72a1.17 1.17 0 0 1 1.52 0C14.51 3.81 17 5 19 5a1 1 0 0 1 1 1z"/><path d="m9 12 2 2 4-4"/></svg>防护状态</div><div class="val" id="s-protect">—</div></div>
     <div class="stat"><div class="lab"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>已转发请求</div><div class="val" id="s-req">0</div></div>
@@ -179,6 +181,13 @@
           <option value="600">自动保活：每 10 分钟</option>
           <option value="300">自动保活：每 5 分钟（更耗额度）</option>
           <option value="1800">自动保活：每 30 分钟（省额度）</option>
+        </select>
+        <select id="sel-tz" title="请求时区归一化：把请求体里的时区改写为固定值（与出口 IP 地区一致可降低风控信号，社区实测）">
+          <option value="off">时区归一化：关</option>
+          <option value="America/Los_Angeles">改写为：美西</option>
+          <option value="America/New_York">改写为：美东</option>
+          <option value="Asia/Tokyo">改写为：日本</option>
+          <option value="Asia/Singapore">改写为：新加坡</option>
         </select>
         <select id="sel-fallback" title="没有合格 state 时的行为">
           <option value="passthrough">无 state 时：正常转发（推荐）</option>
@@ -269,6 +278,43 @@ function render(s){
       `点右上角「<b>重新体检</b>」测一次（每个出口 1 条极短消息，消耗少量额度），` +
       `即可知道当前节点是否被降智。平时无需手动操作，工具会自动保活。`);
   }
+  // ---- 深度归因反馈横幅 ----
+  const ab = $('attr-banner');
+  const attr = s.attribution;
+  if (attr && attr.running){
+    ab.classList.remove('hidden');
+    const secs = attr.started ? Math.max(0, Math.floor(Date.now()/1000) - attr.started) : 0;
+    ab.style.border = '1px solid #cdd4e2';
+    ab.innerHTML = '<div style="display:flex;align-items:center;gap:10px;font-size:14px;font-weight:650">' +
+      '<span class="dot" style="background:var(--accent);animation:pulse 2s infinite"></span>' +
+      '深度归因进行中…（3 条较长生成，约 1-3 分钟，已进行 ' + secs + ' 秒）</div>' +
+      '<div style="font-size:12.5px;color:var(--faint);margin-top:6px">完成后这里会显示归因结论；期间可正常使用 Codex。</div>';
+    $('btn-attr').disabled = true;
+  } else {
+    $('btn-attr').disabled = false;
+    if (attr && attr.error){
+      ab.classList.remove('hidden');
+      ab.style.border = '1px solid #f2d4d5';
+      ab.innerHTML = '<div style="font-size:14px;font-weight:700;color:var(--bad)">深度归因失败</div>' +
+        '<div style="font-size:12.5px;color:var(--sub);margin-top:5px">' + attr.error + '</div>' +
+        '<div style="font-size:12px;color:var(--faint);margin-top:5px">可稍后重试；连续失败请查看高级区日志。</div>';
+    } else if (attr && attr.result){
+      const r = attr.result;
+      const match = r.prediction === (sess ? sess.model : '');
+      ab.classList.remove('hidden');
+      ab.style.border = match ? '1px solid #cdeeda' : '1px solid #f2d4d5';
+      const top = (r.top || []).map(t => t.model + ' ' + (t.p*100).toFixed(0) + '%').join(' · ');
+      ab.innerHTML = '<div style="font-size:14.5px;font-weight:750;color:' +
+        (match ? 'var(--ok)' : 'var(--bad)') + '">' +
+        (match ? '归因确认：当前出口在用 ' : '归因发现模型被替换：') + r.prediction +
+        '（' + (r.probability*100).toFixed(0) + '%）</div>' +
+        '<div style="font-size:12.5px;color:var(--sub);margin-top:5px">候选概率：' + top + '</div>' +
+        (match ? '' : '<div style="font-size:12.5px;color:var(--sub);margin-top:5px">已自动清空 state 池并进入自愈循环。</div>');
+    } else {
+      ab.classList.add('hidden');
+    }
+  }
+
   $('s-protect').textContent = protecting ? (sess && sess.state.usable ? '防护中' : '待命中') : '已关闭';
 
   // ---- 出口列表 ----
@@ -307,6 +353,11 @@ function render(s){
     const a = attrEg.attribution;
     rows.push(['深度归因', `<span class="mono">${a.prediction} ${(a.probability*100).toFixed(0)}%</span>（${attrEg.label}）`]);
   }
+  if (s.timezone){
+    rows.push(['请求时区', s.timezone.last_seen
+      ? `${s.timezone.last_seen}${s.timezone.mode === 'fixed' ? ' → ' + s.timezone.value : ''}（改写 ${s.timezone.overrides} 次）`
+      : '未观测到']);
+  }
   $('state-info').innerHTML = rows.map(([k,v]) =>
     `<div class="row"><span class="k">${k}</span><span class="v">${v}</span></div>`).join('');
 
@@ -314,6 +365,9 @@ function render(s){
   $('sel-fallback').value = s.fallback; $('sel-plan').value = s.account_mode;
   if (s.keepalive){
     $('sel-keepalive').value = s.keepalive.enabled ? String(s.keepalive.interval) : 'off';
+  }
+  if (s.timezone){
+    $('sel-tz').value = s.timezone.mode === 'fixed' ? s.timezone.value : 'off';
   }
 
   const renderObs = (el, g) => {
@@ -354,6 +408,10 @@ $('btn-toggle').onclick = () => act({action:'toggle_injection'});
 $('btn-restore').onclick = () => { if(confirm('恢复 Codex 原始配置？（工具将不再接管 Codex）')) act({action:'restore_config'}); };
 $('sel-fallback').onchange = e => act({action:'set_fallback', mode:e.target.value});
 $('sel-plan').onchange = e => act({action:'set_account_mode', mode:e.target.value});
+$('sel-tz').onchange = e => {
+  const v = e.target.value;
+  act({action:'set_timezone', mode: v === 'off' ? 'off' : 'fixed', value: v === 'off' ? undefined : v});
+};
 $('sel-keepalive').onchange = e => {
   const v = e.target.value;
   if (v === 'off') act({action:'set_keepalive', enabled:false});

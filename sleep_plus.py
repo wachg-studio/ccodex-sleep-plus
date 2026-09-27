@@ -659,6 +659,10 @@ class Engine:
         self.probes_total = 0
         self.probe_date = time.strftime("%Y%m%d")
         self.probes_today = 0
+        self.last_seen_tz = ""        # 最近在请求体 environment_context 观测到的时区
+        self.tz_overrides = 0         # 已改写的请求数
+        self.attribution_state = {"running": False, "started": 0, "finished": 0,
+                                  "result": None, "error": ""}
         self.started_at = time.time()
         self.stop = threading.Event()
         self.observations = collections.deque(maxlen=300)
@@ -1163,6 +1167,13 @@ class Engine:
                 "probes_today": self.probes_today,
                 "daily_limit": PROBE_DAILY_LIMIT,
             },
+            "attribution": self.attribution_state,
+            "timezone": {
+                "mode": self.settings.get("tz_mode", "off"),
+                "value": self.settings.get("tz_value", ""),
+                "last_seen": self.last_seen_tz,
+                "overrides": self.tz_overrides,
+            },
         }
 
 
@@ -1529,16 +1540,44 @@ class Gateway(BaseHTTPRequestHandler):
             if _mt is None:
                 self._json({"ok": False, "error": "指纹库缺失，请重装或从源码运行"})
                 return
+            if eng.attribution_state.get("running"):
+                self._json({"ok": True, "running": True})
+                return
             sess = self._first_session_or_bootstrap()
             if not sess:
                 self._json({"ok": False, "error": "没有可用会话（缺少登录凭据）"})
                 return
             egress = eng.egress_by_id(sess.state_egress) or eng.default_egress()
+            eng.attribution_state.update(running=True, started=int(time.time()),
+                                         finished=0, error="")
 
             def _run():
-                r = eng.deep_attribution(sess, egress)
-                log("panel_attribution", ok=r.get("ok"))
+                try:
+                    r = eng.deep_attribution(sess, egress)
+                    if r.get("ok"):
+                        eng.attribution_state["result"] = r
+                        eng.attribution_state["error"] = ""
+                    else:
+                        eng.attribution_state["error"] = r.get("error") or f"失败（status={r.get('status', 0)}）"
+                except Exception as e:
+                    eng.attribution_state["error"] = f"{e.__class__.__name__}: {e}"[:160]
+                finally:
+                    eng.attribution_state["running"] = False
+                    eng.attribution_state["finished"] = int(time.time())
+                log("panel_attribution", ok=not eng.attribution_state["error"],
+                    error=eng.attribution_state["error"][:80])
             threading.Thread(target=_run, daemon=True).start()
+            self._json({"ok": True, "running": True})
+        elif action == "set_timezone":
+            mode = req.get("mode") if req.get("mode") in ("off", "fixed") else None
+            if not mode:
+                self._fail(400, "invalid_mode", "mode 必须是 off 或 fixed")
+                return
+            eng.settings["tz_mode"] = mode
+            if req.get("value"):
+                eng.settings["tz_value"] = str(req["value"])[:64]
+            eng.persist.write(_merge_persist(eng))
+            log("timezone_updated", mode=mode, value=eng.settings.get("tz_value"))
             self._json({"ok": True})
         elif action == "restore_config":
             r = restore_provider()
@@ -1604,6 +1643,17 @@ class Gateway(BaseHTTPRequestHandler):
                                f"支持的模型：{'、'.join(SUPPORTED_MODELS)}；请在 Codex 中切换。")
                     return
                 compact = path.endswith("/compact") or is_compact_trigger(body)
+                # 时区归一化（社区实测：本地时区与出口 IP 地区不一致是降级/风控信号；
+                # 参考 oai-adversarial-plugin 与 NodeSeek 实测帖，改写请求体内的
+                # environment_context 时区，可回滚、默认关闭）
+                if eng.settings.get("tz_mode") == "fixed" and eng.settings.get("tz_value"):
+                    m = re.search(rb"<timezone>([^<]{1,64})</timezone>", body)
+                    if m:
+                        eng.last_seen_tz = m.group(1).decode("utf8", "replace")
+                        target = eng.settings["tz_value"].encode()
+                        body = re.sub(rb"<timezone>[^<]{1,64}</timezone>",
+                                      b"<timezone>" + target + b"</timezone>", body)
+                        eng.tz_overrides += 1
 
         sess, err = eng.borrow(self.headers, model)
         if not sess:
@@ -1727,7 +1777,8 @@ def _merge_persist(engine: Engine):
     settings = engine.settings
     data["settings"] = {k: settings.get(k) for k in
                         ("injection_enabled", "fallback", "account_mode", "model",
-                         "keepalive_enabled", "keepalive_interval")}
+                         "keepalive_enabled", "keepalive_interval",
+                         "tz_mode", "tz_value")}
     data["panel_key"] = PANEL_KEY
     data["port"] = LISTEN_PORT
     return data
@@ -2305,6 +2356,8 @@ def main():
     settings.setdefault("model", DEFAULT_MODEL)
     settings.setdefault("keepalive_enabled", True)
     settings.setdefault("keepalive_interval", KEEPALIVE_DEFAULT)
+    settings.setdefault("tz_mode", "off")            # off | fixed
+    settings.setdefault("tz_value", "America/Los_Angeles")
     # 面板密钥：优先沿用已保存值；否则按本机派生（跨重启稳定，面板链接不会过期）
     PANEL_KEY = saved.get("panel_key") or hashlib.sha256(
         f"ccodex-sleep-plus:{Path.home()}".encode()).hexdigest()[:16]

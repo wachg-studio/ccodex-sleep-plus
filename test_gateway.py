@@ -48,6 +48,7 @@ class MockUpstream(BaseHTTPRequestHandler):
         seen["state_header"] = self.headers.get(sp.STATE_HEADER)
         seen["auth"] = self.headers.get("Authorization")
         seen["model"] = json.loads(body).get("model")
+        seen["raw_body"] = body.decode("utf8", "replace")
         if self.path.endswith("/responses"):
             payload = (b"event: response.output_text.delta\n"
                        + ('data: {"type":"response.output_text.delta","delta":"'
@@ -134,6 +135,21 @@ def run_gateway_test():
     r = c.getresponse()
     r.read()
     check("gzip request decoded", r.status == 200 and seen.get("model") == "gpt-6-astra")
+
+    # 2b) 时区归一化改写
+    engine.settings["tz_mode"] = "fixed"
+    engine.settings["tz_value"] = "America/Los_Angeles"
+    tz_body = json.dumps({"model": "gpt-6-astra",
+                          "input": [{"type": "message", "role": "user", "content": [
+                              {"type": "input_text", "text":
+                               "<environment_context><timezone>Asia/Shanghai</timezone></environment_context> hi"}]}]}).encode()
+    c.request("POST", sp.UPSTREAM_BASE + "/responses", body=tz_body,
+              headers={"Authorization": "Bearer test-token-1234567890",
+                       "chatgpt-account-id": "acc-1", "Content-Type": "application/json"})
+    r = c.getresponse(); r.read()
+    check("tz rewritten upstream", r.status == 200 and "America/Los_Angeles" in seen.get("raw_body", "")
+          and "Asia/Shanghai" not in seen.get("raw_body", ""))
+    engine.settings["tz_mode"] = "off"
 
     # 3) 不支持的模型被拦
     c.request("POST", sp.UPSTREAM_BASE + "/responses",
