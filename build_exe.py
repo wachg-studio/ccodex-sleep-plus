@@ -12,6 +12,7 @@ PyInstaller.__main__.run([
     "--name", "ccodex-sleep-plus",
     "--icon", str(ico),
     "--add-data", f"{sp.Path(__file__).parent / 'panel.html'};.",
+    "--add-data", f"{sp.Path(__file__).parent / 'data' / 'gpt_bank.json'};data",
     "--hidden-import", "pystray._win32",
     "--collect-all", "PIL",
     "--collect-all", "pystray",

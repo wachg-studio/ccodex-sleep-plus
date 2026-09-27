@@ -53,6 +53,11 @@ try:
 except ImportError:  # Python < 3.14
     _zstd = None
 
+try:
+    import modeltrace as _mt  # ModelTrace 归因（纯标准库移植，data/gpt_bank.json）
+except Exception:
+    _mt = None
+
 APP = "ccodex-sleep-plus"
 PROVIDER_ID = "sleep-plus"
 STATE_HEADER = "X-Codex-Turn-State"
@@ -283,6 +288,7 @@ class Egress:
         self.uses = 0
         self.quality = "unknown"      # healthy / degraded / severely / unknown
         self.quality_answer = ""
+        self.attribution = None       # ModelTrace 深度归因结果
 
     def open_socket(self, dst_host, dst_port, timeout) -> socket.socket:
         if self.kind == "direct":
@@ -372,6 +378,7 @@ class Egress:
             "last_ok": int(self.last_ok), "last_error": self.last_error,
             "uses": self.uses, "quality": self.quality,
             "quality_answer": self.quality_answer,
+            "attribution": self.attribution,
         }
 
 
@@ -812,6 +819,48 @@ class Engine:
                 sess.limit_until = max(sess.limit_until, time.time() + delay)
 
     # ---- 探测 ----
+    def _generate_once(self, sess: Session, egress: Egress, prompt: str,
+                       system: str = "", timeout: int = PROBE_TIMEOUT):
+        """通用单次生成：发 prompt 读全文。返回文本/状态头/限流信息。"""
+        headers = dict(sess.headers)
+        headers["Content-Type"] = "application/json"
+        headers["Accept"] = "text/event-stream"
+        body = json.dumps({
+            "model": sess.model,
+            "instructions": system or QUALITY_PROBE_SYSTEM,
+            "input": [{"type": "message", "role": "user",
+                       "content": [{"type": "input_text", "text": prompt}]}],
+            "stream": True, "store": False, "parallel_tool_calls": True,
+            "include": ["reasoning.encrypted_content"],
+        }).encode()
+        conn = egress.https_connection(UPSTREAM_HOST, timeout)
+        try:
+            conn.request("POST", UPSTREAM_BASE + "/responses", body=body, headers=headers)
+            resp = conn.getresponse()
+            state_raw = resp.headers.get(STATE_HEADER) or resp.headers.get(STATE_HEADER.lower()) or ""
+            if resp.status != 200:
+                retry = resp.headers.get("Retry-After") or ""
+                try:
+                    retry = int(retry)
+                except ValueError:
+                    retry = 0
+                return {"ok": False, "status": resp.status, "retry_after": retry}
+            data = resp.read(2 << 21)
+            completed, failure, fstatus = stream_outcome(data)
+            if failure:
+                return {"ok": False, "status": fstatus or resp.status, "retry_after": 0}
+            if not completed:
+                return {"ok": False, "status": resp.status, "retry_after": 0}
+            return {"ok": True, "status": 200, "state": state_raw,
+                    "text": sse_answer_text(data)}
+        except OSError as e:
+            return {"ok": False, "status": 0, "retry_after": 0, "error": str(e)}
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
     def probe_once(self, sess: Session, egress: Egress):
         """发一条极短的知识探针请求：一次请求同时采集 turn-state 并判定出口
         serving 质量（社区 csss 项目的 iPhone 知识新鲜度法）。消耗真实额度。"""
@@ -864,6 +913,48 @@ class Engine:
                 conn.close()
             except Exception:
                 pass
+
+    def deep_attribution(self, sess: Session, egress: Egress):
+        """ModelTrace 深度归因：3 条长整数挑战 → 数字指纹归因 8 个候选模型。
+        比 iPhone 知识探针更硬的证据；成本为 3 次完整生成。"""
+        if _mt is None:
+            return {"ok": False, "error": "指纹库或 modeltrace 模块缺失"}
+        challenges = _mt.generate_challenges(3)
+        outputs = []
+        for ch in challenges:
+            r = self._generate_once(sess, egress, ch["prompt"], timeout=180)
+            if not r.get("ok"):
+                return {"ok": False, "status": r.get("status", 0), "retry_after": r.get("retry_after", 0),
+                        "error": f"挑战 {ch['id']} 未完成（status={r.get('status', 0)}）"}
+            outputs.append({"text": r.get("text", ""), "expected_count": ch["expected_count"]})
+        try:
+            res = _mt.analyze_outputs(outputs, _mt.load_bank())
+        except ValueError as e:
+            return {"ok": False, "error": str(e)[:120]}
+        egress.attribution = {
+            "prediction": res["prediction"], "probability": round(res["probability"], 3),
+            "top": [{"model": r["model"], "p": round(r["probability"], 3)} for r in res["results"][:3]],
+            "at": int(time.time()),
+        }
+        # 归因结论联动质量判定与自愈
+        if res["prediction"] == sess.model:
+            egress.quality = "healthy"
+            egress.quality_answer = f"归因 {res['prediction']} {res['probability']:.0%}"
+            log("attribution_finished", egress=egress.id, prediction=res["prediction"],
+                probability=round(res["probability"], 3), verdict="match")
+        else:
+            egress.quality = "degraded"
+            egress.quality_answer = f"归因 {res['prediction']} {res['probability']:.0%}"
+            sess.store.clear()
+            sess.state_healthy = False
+            sess.last_probe_result = "attribution_mismatch"
+            sess.next_probe = min(sess.next_probe, time.time() + DEGRADED_RETRY)
+            log("attribution_finished", egress=egress.id, prediction=res["prediction"],
+                expected=sess.model, probability=round(res["probability"], 3),
+                verdict="mismatch", level="warn",
+                detail="归因与请求模型不符，已清空 state 池并进入自愈")
+        self.save()
+        return {"ok": True, **egress.attribution}
 
     def refresh(self, sess: Session, manual=False):
         """一轮采集：按出口轮换尝试，直到拿到合格 state 或触发上游限制。"""
@@ -1433,6 +1524,21 @@ class Gateway(BaseHTTPRequestHandler):
             eng.persist.write(_merge_persist(eng))
             log("keepalive_updated", enabled=eng.settings["keepalive_enabled"],
                 interval=eng.settings.get("keepalive_interval"))
+            self._json({"ok": True})
+        elif action == "attribute":
+            if _mt is None:
+                self._json({"ok": False, "error": "指纹库缺失，请重装或从源码运行"})
+                return
+            sess = self._first_session_or_bootstrap()
+            if not sess:
+                self._json({"ok": False, "error": "没有可用会话（缺少登录凭据）"})
+                return
+            egress = eng.egress_by_id(sess.state_egress) or eng.default_egress()
+
+            def _run():
+                r = eng.deep_attribution(sess, egress)
+                log("panel_attribution", ok=r.get("ok"))
+            threading.Thread(target=_run, daemon=True).start()
             self._json({"ok": True})
         elif action == "restore_config":
             r = restore_provider()
@@ -2099,6 +2205,18 @@ def selftest():
 
     html = _panel_html()
     check("panel.html present", "重新体检" in html and "btn-check" in html)
+
+    # ModelTrace 归因栈
+    if _mt is not None:
+        chs = _mt.generate_challenges(3)
+        check("modeltrace challenges", len(chs) == 3 and
+              all(292 <= c["expected_count"] <= 332 for c in chs))
+        bank = _mt.load_bank()
+        ids = [m["id"] for m in bank["models"]]
+        check("modeltrace bank", "gpt-6-astra" in ids and "gpt-5.6-luna" in ids)
+        check("modeltrace parse", _mt.parse_numbers("1, 5, 999, 7 8") == [1, 5, 7, 8])
+    else:
+        check("modeltrace available", False)
 
     print("selftest", "OK" if ok else "FAILED")
     return ok

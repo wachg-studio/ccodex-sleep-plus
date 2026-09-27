@@ -289,11 +289,43 @@ def run_healing_test():
     upstream.shutdown()
 
 
+# ---- ModelTrace 深度归因集成测试（真实指纹样本，mock 上游） ----
+def run_attribution_test():
+    global MOCK_ANSWER, MOCK_STATE
+    fixtures = json.loads((Path(__file__).parent / "data" / "attribution_fixtures.json").read_text(encoding="utf8"))
+    upstream = ThreadingHTTPServer(("127.0.0.1", MOCK_PORT), MockUpstream)
+    upstream.daemon_threads = True
+    threading.Thread(target=upstream.serve_forever, daemon=True).start()
+    sp.UPSTREAM_HOST = "127.0.0.1"
+    engine = sp.Engine({"injection_enabled": True, "fallback": "passthrough",
+                        "account_mode": "auto", "model": "gpt-6-astra"}, sp.Persist())
+    engine.egresses = [HTTPEgress("mock", "mock-upstream", "direct", "127.0.0.1", MOCK_PORT)]
+    sess, _ = engine.borrow({"Authorization": "Bearer attr-token-123456",
+                             "chatgpt-account-id": "a1"}, "gpt-6-astra")
+
+    # 归因命中：mock 返回 astra 真实指纹 → match，quality=healthy
+    MOCK_STATE = make_state(10)
+    MOCK_ANSWER = fixtures["gpt-6-astra"]["text"]
+    sess.store.offer(sp.parse_state(MOCK_STATE))
+    r = engine.deep_attribution(sess, engine.egresses[0])
+    check("attribution match", r.get("ok") and r.get("prediction") == "gpt-6-astra")
+    check("attribution sets healthy", engine.egresses[0].quality == "healthy")
+
+    # 归因失配：mock 返回 luna 指纹 → mismatch，state 池清空进入自愈
+    MOCK_ANSWER = fixtures["gpt-5.6-luna"]["text"]
+    r2 = engine.deep_attribution(sess, engine.egresses[0])
+    check("attribution mismatch detected", r2.get("ok") and r2.get("prediction") == "gpt-5.6-luna")
+    check("mismatch clears state pool", sess.store.acquire(time.time()) is None)
+    check("mismatch marks unhealthy", sess.state_healthy is False)
+    upstream.shutdown()
+
+
 if __name__ == "__main__":
     run_gateway_test()
     run_config_test()
     run_installer_dryrun_test()
     run_healing_test()
+    run_attribution_test()
     failed = [n for n, ok in results if not ok]
     print(f"\n{len(results) - len(failed)}/{len(results)} passed")
     sys.exit(1 if failed else 0)

@@ -173,6 +173,7 @@
       <div class="actions">
         <button id="btn-toggle"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18.36 6.64a9 9 0 1 1-12.73 0"/><line x1="12" y1="2" x2="12" y2="11"/></svg><span id="btn-toggle-t">关闭注入</span></button>
         <button id="btn-probe"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-2.64-6.36"/><polyline points="21 3 21 9 15 9"/></svg>只采 state</button>
+        <button id="btn-attr"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 3v18h18"/><path d="m19 9-5 5-4-4-3 3"/></svg>深度归因（较贵）</button>
         <select id="sel-keepalive" title="自动保活：定期探针维持满血 state">
           <option value="off">自动保活：关</option>
           <option value="600">自动保活：每 10 分钟</option>
@@ -301,6 +302,11 @@ function render(s){
   if (s.keepalive){
     rows.push(['今日探针', `${s.keepalive.probes_today} / ${s.keepalive.daily_limit} 次`]);
   }
+  const attrEg = (s.egresses||[]).find(e => e.attribution);
+  if (attrEg){
+    const a = attrEg.attribution;
+    rows.push(['深度归因', `<span class="mono">${a.prediction} ${(a.probability*100).toFixed(0)}%</span>（${attrEg.label}）`]);
+  }
   $('state-info').innerHTML = rows.map(([k,v]) =>
     `<div class="row"><span class="k">${k}</span><span class="v">${v}</span></div>`).join('');
 
@@ -343,6 +349,7 @@ async function act(body){
 }
 $('btn-check').onclick = () => act({action:'egress_check'});
 $('btn-probe').onclick = () => act({action:'probe_now'});
+$('btn-attr').onclick = () => { if(confirm('深度归因会发 3 条较长生成请求（比普通探针贵不少），用于确认当前出口实际服务的模型身份。继续？')) act({action:'attribute'}); };
 $('btn-toggle').onclick = () => act({action:'toggle_injection'});
 $('btn-restore').onclick = () => { if(confirm('恢复 Codex 原始配置？（工具将不再接管 Codex）')) act({action:'restore_config'}); };
 $('sel-fallback').onchange = e => act({action:'set_fallback', mode:e.target.value});
