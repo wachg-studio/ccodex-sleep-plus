@@ -278,6 +278,21 @@ function render(s){
       `点右上角「<b>重新体检</b>」测一次（每个出口 1 条极短消息，消耗少量额度），` +
       `即可知道当前节点是否被降智。平时无需手动操作，工具会自动保活。`);
   }
+  // ---- 重新体检 / 采集按钮运行态 ----
+  if (s.check && s.check.running){
+    $('btn-check').disabled = true;
+    const secs = s.check.started ? Math.max(0, Math.floor(Date.now()/1000) - s.check.started) : 0;
+    $('btn-check').lastChild.textContent = ' 检测中… ' + secs + 's';
+  } else {
+    $('btn-check').disabled = false;
+    $('btn-check').lastChild.textContent = ' 重新体检';
+  }
+  if (s.probe_now && s.probe_now.running){
+    $('btn-probe').disabled = true;
+  } else if (!(s.attribution && s.attribution.running)) {
+    $('btn-probe').disabled = false;
+  }
+
   // ---- 深度归因反馈横幅 ----
   const ab = $('attr-banner');
   const attr = s.attribution;

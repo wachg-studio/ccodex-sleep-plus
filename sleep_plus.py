@@ -469,8 +469,14 @@ def detect_egresses():
         except OSError:
             continue
 
-    found.append(Egress("direct", "直连（不经代理）", "direct", "", 0))
+    if _ALLOW_DIRECT_EGRESS:
+        found.append(Egress("direct", "直连（不经代理）", "direct", "", 0))
     return found
+
+
+# 直连默认禁用：在无法直连 OpenAI 的地区，直连出口既浪费探针又有账号风险；
+# 需要时用环境变量 CCSLEEP_ALLOW_DIRECT=1 显式开启
+_ALLOW_DIRECT_EGRESS = os.environ.get("CCSLEEP_ALLOW_DIRECT") == "1"
 
 
 # ---------------------------------------------------------------- SSE 解析 --
@@ -715,6 +721,8 @@ class Engine:
         self.attribution_state = {"running": False, "started": 0, "finished": 0,
                                   "result": None, "error": ""}
         self.heal_events = collections.deque(maxlen=50)   # detected/recovered 事件流
+        self.check_state = {"running": False, "started": 0}
+        self.probe_state = {"running": False, "started": 0}
         self.started_at = time.time()
         self.stop = threading.Event()
         self.observations = collections.deque(maxlen=300)
@@ -901,6 +909,7 @@ class Engine:
                        "content": [{"type": "input_text", "text": prompt}]}],
             "stream": True, "store": False, "parallel_tool_calls": True,
             "include": ["reasoning.encrypted_content"],
+            "reasoning": {"effort": self.settings.get("probe_effort") or "low"},
         }).encode()
         conn = egress.https_connection(UPSTREAM_HOST, timeout)
         try:
@@ -943,6 +952,7 @@ class Engine:
                        "content": [{"type": "input_text", "text": prompt or pick_probe()}]}],
             "stream": True, "store": False, "parallel_tool_calls": True,
             "include": ["reasoning.encrypted_content"],
+            "reasoning": {"effort": self.settings.get("probe_effort") or "low"},
         }).encode()
         conn = egress.https_connection(UPSTREAM_HOST, PROBE_TIMEOUT)
         try:
@@ -1231,7 +1241,10 @@ class Engine:
                     if not sess.headers.get("Authorization"):
                         continue
                     need = sess.store.needs_refresh(now) or not sess.state_healthy
-                    if keepalive_on and now >= sess.next_keepalive:
+                    # 活跃跳过：最近一个保活周期内有真实用户请求时，用户流量本身
+                    # 就在维持链路（响应还会带回新 state），无需额外探针
+                    user_active = now - sess.last_active < keepalive_iv
+                    if keepalive_on and now >= sess.next_keepalive and not user_active:
                         need = True
                     # 刚从降智恢复：立即补采满血 state，不受探测冷却限制
                     recovered_recently = any(
@@ -1291,6 +1304,8 @@ class Engine:
                 "daily_limit": PROBE_DAILY_LIMIT,
             },
             "attribution": self.attribution_state,
+            "check": self.check_state,
+            "probe_now": self.probe_state,
             "heal": self.heal_summary(),
             "timezone": {
                 "mode": self.settings.get("tz_mode", "off"),
@@ -1597,12 +1612,22 @@ class Gateway(BaseHTTPRequestHandler):
         action = req.get("action")
         eng = self.engine
         if action == "probe_now":
+            if eng.probe_state.get("running"):
+                self._json({"ok": True, "running": True})
+                return
             sess = self._first_session_or_bootstrap()
             if not sess:
                 self._json({"ok": False, "error": "没有可用会话（缺少登录凭据）"})
                 return
-            threading.Thread(target=eng.refresh, args=(sess, True), daemon=True).start()
-            self._json({"ok": True})
+            eng.probe_state.update(running=True, started=int(time.time()))
+
+            def _probe():
+                try:
+                    eng.refresh(sess, manual=True)
+                finally:
+                    eng.probe_state["running"] = False
+            threading.Thread(target=_probe, daemon=True).start()
+            self._json({"ok": True, "running": True})
         elif action == "toggle_injection":
             eng.settings["injection_enabled"] = not eng.settings.get("injection_enabled", True)
             eng.persist.write(_merge_persist(eng))
@@ -1633,31 +1658,38 @@ class Gateway(BaseHTTPRequestHandler):
             log("state_cleared")
             self._json({"ok": True})
         elif action == "egress_check":
+            if eng.check_state.get("running"):
+                self._json({"ok": True, "running": True})
+                return
             sess = self._first_session_or_bootstrap()
             if not sess:
                 self._json({"ok": False, "error": "没有可用会话（缺少登录凭据）"})
                 return
+            eng.check_state.update(running=True, started=int(time.time()))
 
             def _check_all():
-                for e in eng.egresses:
-                    for i, q in enumerate(QUALITY_PROBES):
-                        r = eng.probe_once(sess, e, prompt=q)
-                        log("egress_quality", egress=e.id, round=i + 1,
-                            ok=r.get("ok"), single=r.get("quality"),
-                            combined=e.quality, answer=e.quality_answer)
-                        if not r.get("ok") and r.get("status") in (401, 403, 429):
-                            return
-                    if e.quality in ("degraded", "severely"):
-                        if sess.state_egress == e.id:
-                            sess.store.clear()
-                            sess.state_healthy = False
-                            sess.next_probe = min(sess.next_probe, time.time() + DEGRADED_RETRY)
-                            log("egress_quality_isolated", egress=e.id,
-                                detail="体检综合判定降智（绑定出口），已清池自愈")
-                        else:
-                            log("egress_quality_noted", egress=e.id,
-                                detail="该出口降智，但 state 绑定其他出口，无需隔离")
-                eng.save()
+                try:
+                    for e in eng.egresses:
+                        for i, q in enumerate(QUALITY_PROBES):
+                            r = eng.probe_once(sess, e, prompt=q)
+                            log("egress_quality", egress=e.id, round=i + 1,
+                                ok=r.get("ok"), single=r.get("quality"),
+                                combined=e.quality, answer=e.quality_answer)
+                            if not r.get("ok") and r.get("status") in (401, 403, 429):
+                                return
+                        if e.quality in ("degraded", "severely"):
+                            if sess.state_egress == e.id:
+                                sess.store.clear()
+                                sess.state_healthy = False
+                                sess.next_probe = min(sess.next_probe, time.time() + DEGRADED_RETRY)
+                                log("egress_quality_isolated", egress=e.id,
+                                    detail="体检综合判定降智（绑定出口），已清池自愈")
+                            else:
+                                log("egress_quality_noted", egress=e.id,
+                                    detail="该出口降智，但 state 绑定其他出口，无需隔离")
+                    eng.save()
+                finally:
+                    eng.check_state["running"] = False
             threading.Thread(target=_check_all, daemon=True).start()
             self._json({"ok": True})
         elif action == "set_keepalive":
@@ -2549,6 +2581,8 @@ def main():
     settings.setdefault("keepalive_interval", KEEPALIVE_DEFAULT)
     settings.setdefault("tz_mode", "off")            # off | fixed
     settings.setdefault("tz_value", "America/Los_Angeles")
+    settings.setdefault("probe_effort", "low")       # 探针推理档（省 token）
+    settings.setdefault("allow_direct", False)
     # 面板密钥：优先沿用已保存值；否则按本机派生（跨重启稳定，面板链接不会过期）
     PANEL_KEY = saved.get("panel_key") or hashlib.sha256(
         f"ccodex-sleep-plus:{Path.home()}".encode()).hexdigest()[:16]
