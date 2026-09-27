@@ -80,7 +80,8 @@ MANAGED_MARK = "# --- managed by ccodex-sleep-plus ---"
 # 各账号规则接纳的密文块数集合。10/12 是社区经验旧形状（292/332 字符）；
 # 33 块（780 字符）是 2026-09-22 官方新模型上线后的新形状
 # （参见 gylive/ccodex-sleep-state issue #13 的实测反馈）。
-PLAN_SHAPES = {"personal": {10, 33}, "team": {12, 33}}
+PLAN_SHAPES = {"personal": {10}, "team": {12}}
+INJECT_MAX_AGE = 240      # 注入用 state 的最大年龄（社区实测凭据窗口 ~240s）
 
 
 def data_dir() -> Path:
@@ -197,7 +198,12 @@ class StateStore:
 
     def acquire(self, now):
         with self.lock:
-            return self.active if state_accepts(self.active, self.blocks, now) else None
+            st = self.active
+            if not state_accepts(st, self.blocks, now):
+                return None
+            if st.issued + INJECT_MAX_AGE < now:
+                return None      # 凭据窗口已过：宁可不用也不注入过期 state
+            return st
 
     def offer(self, st: State):
         with self.lock:
@@ -701,7 +707,7 @@ class Session:
         self.last_autocheck = 0.0      # 观测触发自动体检的节流
 
 
-KEEPALIVE_DEFAULT = 600       # 保活间隔（秒）
+KEEPALIVE_DEFAULT = 300       # 保活间隔（秒）：贴近 ~240s 凭据窗口持续打票
 PROBE_DAILY_LIMIT = 200       # 每日探针请求上限（防失控烧额度）
 DEGRADED_RETRY = 240          # 出口降智后的自愈重试间隔（对齐社区观察的 ~240s 凭据窗口）
 
@@ -1052,19 +1058,14 @@ class Engine:
             limit = min(MAX_PROBES_PER_ROUND, len(self.egresses))
             attempts = 0
             accepted = False
-            # 出口绑定策略：常规采集固定用 state 绑定出口（链路一致，避免出口
-            # 跳变）；仅当连续两轮综合降智（升级路径）才轮换到下一个出口
-            bound = self.egress_by_id(sess.state_egress)
-            preferred = bound if (bound and sess.degraded_rounds < 2) else None
+            # 292 打票模式：合格 state 只来自部分出口，采集按出口轮换尝试；
+            # 注入仍严格绑定采集出口，隔离按出口关联（不影响其他出口的 state）
             for _ in range(len(self.egresses)):
                 if attempts >= limit or self.stop.is_set():
                     break
-                if preferred is not None:
-                    egress = preferred
-                else:
-                    idx = sess.egress_cursor % len(self.egresses)
-                    sess.egress_cursor += 1
-                    egress = self.egresses[idx]
+                idx = sess.egress_cursor % len(self.egresses)
+                sess.egress_cursor += 1
+                egress = self.egresses[idx]
                 if self._probe_budget_exceeded():
                     log("probe_skipped", level="warn", detail="已达每日探针上限，防额度失控")
                     return
@@ -2597,9 +2598,9 @@ def main():
     persist = Persist()
     saved = persist.read()
     settings = saved.get("settings") or {}
-    # 注入默认关闭：实测注入的 state 会被上游拒绝（流中断，out=0 无完成事件），
-    # 与社区 Tonkic 插件停维原因一致。检测/体检/自愈不受影响（不注入）。
-    settings.setdefault("injection_enabled", False)
+    # 注入默认开启（292-ticket 模式）：只注入 10/12 块且 240s 内的新鲜 state，
+    # 并有"连续 2 次断流自动关闭"的兜底（inject_stream_incomplete）
+    settings.setdefault("injection_enabled", True)
     settings.setdefault("fallback", "passthrough")
     settings.setdefault("account_mode", "auto")
     settings.setdefault("model", DEFAULT_MODEL)
