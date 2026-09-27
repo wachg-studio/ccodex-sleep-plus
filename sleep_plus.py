@@ -695,6 +695,7 @@ class Session:
         self.state_healthy = True      # 当前 state 是否采集自满血出口
         self.next_keepalive = 0.0      # 保活下一次触发时间
         self.degraded_rounds = 0       # 连续综合降智的轮数（升级自愈用）
+        self.inject_failures = 0       # 注入请求未完成（断流）的连续次数
         self.obs_reason_ema = None     # 注入请求 reasoning tokens 指数均值基线
         self.obs_samples = 0
         self.last_autocheck = 0.0      # 观测触发自动体检的节流
@@ -1998,8 +1999,21 @@ class Gateway(BaseHTTPRequestHandler):
                         reason_tokens=r_tok, baseline=int(sess.obs_reason_ema),
                         detail="推理深度骤降，自动触发出口体检")
                     threading.Thread(target=eng.autocheck, args=(sess,), daemon=True).start()
-        if inject and used and 200 <= resp.status < 300:
-            if sess.store.observe(resp_state, used):
+        if inject and 200 <= resp.status < 300:
+            if observer is not None and not observer.completed:
+                # 注入的请求流未完成 = 上游拒绝注入 state 的典型表现
+                sess.inject_failures += 1
+                log("inject_stream_incomplete", level="warn",
+                    failures=sess.inject_failures,
+                    detail="注入的请求被上游中途断流")
+                if sess.inject_failures >= 2:
+                    eng.settings["injection_enabled"] = False
+                    eng.persist.write(_merge_persist(eng))
+                    log("injection_disabled_by_upstream", level="warn",
+                        detail="注入连续被拒，已自动切换为纯转发模式（检测/自愈不受影响）")
+            else:
+                sess.inject_failures = 0
+            if used and sess.store.observe(resp_state, used):
                 log("state_strike", detail="响应 state 形状异常，已计数并切换备用；响应体未销毁")
         log("request_finished", status=resp.status, model=model, compact=compact,
             inject=inject, egress=egress.id, ms=int((time.time() - started) * 1000))
@@ -2583,7 +2597,9 @@ def main():
     persist = Persist()
     saved = persist.read()
     settings = saved.get("settings") or {}
-    settings.setdefault("injection_enabled", True)
+    # 注入默认关闭：实测注入的 state 会被上游拒绝（流中断，out=0 无完成事件），
+    # 与社区 Tonkic 插件停维原因一致。检测/体检/自愈不受影响（不注入）。
+    settings.setdefault("injection_enabled", False)
     settings.setdefault("fallback", "passthrough")
     settings.setdefault("account_mode", "auto")
     settings.setdefault("model", DEFAULT_MODEL)
