@@ -1,0 +1,339 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ccodex sleep plus</title>
+<style>
+  :root{
+    --bg:#f4f6fb; --card:#fff; --ink:#181b22; --sub:#5f6672; --faint:#9aa1ad;
+    --line:#e8ebf2; --accent:#4f6bf0; --accent2:#8b5cf6;
+    --ok:#14a35c; --okbg:#e8f8f0; --warn:#c07a10; --warnbg:#fdf3e2;
+    --bad:#d6484b; --badbg:#fdebec; --info:#2f6fdb; --infobg:#e9f0fe;
+    --mono:ui-monospace,Consolas,monospace;
+    --r-lg:20px; --r-md:14px;
+    --shadow:0 1px 2px rgba(16,24,40,.05),0 10px 30px rgba(16,24,40,.06);
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{font-family:system-ui,-apple-system,'Segoe UI','PingFang SC','Microsoft YaHei',sans-serif;
+    background:radial-gradient(900px 340px at 85% -60px, rgba(139,92,246,.10), transparent 60%),
+      radial-gradient(700px 300px at -10% -40px, rgba(79,107,240,.12), transparent 55%), var(--bg);
+    color:var(--ink);-webkit-font-smoothing:antialiased;padding:26px 20px 44px}
+  .app{max-width:860px;margin:0 auto}
+  .fade{animation:fadeUp .4s cubic-bezier(.22,.9,.3,1) both}
+  @keyframes fadeUp{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:none}}
+
+  header{display:flex;align-items:center;justify-content:space-between;gap:14px;margin-bottom:18px;flex-wrap:wrap}
+  .brand{display:flex;align-items:center;gap:13px}
+  .logo{width:44px;height:44px;border-radius:14px;display:grid;place-items:center;color:#fff;
+    background:linear-gradient(135deg,var(--accent),var(--accent2));box-shadow:0 8px 20px rgba(79,107,240,.35)}
+  .logo svg{width:23px;height:23px}
+  .brand h1{font-size:18px;font-weight:750}
+  .brand h1 em{font-style:normal;color:var(--accent)}
+  .brand p{font-size:12px;color:var(--sub);margin-top:1px}
+  .pill{display:inline-flex;align-items:center;gap:7px;font-size:12.5px;font-weight:650;
+    padding:7px 13px;border-radius:999px;background:var(--card);border:1px solid var(--line);color:var(--sub)}
+  .dot{width:8px;height:8px;border-radius:50%;background:var(--faint)}
+  .pill.ok{background:var(--okbg);border-color:#cdeeda;color:var(--ok)}
+  .pill.ok .dot{background:var(--ok);animation:pulse 2s infinite}
+  .pill.bad{background:var(--badbg);border-color:#f6d3d4;color:var(--bad)} .pill.bad .dot{background:var(--bad)}
+  .pill.warn{background:var(--warnbg);border-color:#f3ddb4;color:var(--warn)} .pill.warn .dot{background:var(--warn)}
+  @keyframes pulse{70%{box-shadow:0 0 0 7px rgba(20,163,92,0)}100%{box-shadow:0 0 0 0 rgba(20,163,92,0)}}
+
+  .hero{border-radius:var(--r-lg);padding:26px 28px;margin-bottom:14px;border:1px solid var(--line);
+    background:var(--card);box-shadow:var(--shadow);display:flex;gap:20px;align-items:center;flex-wrap:wrap}
+  .hero .face{width:58px;height:58px;border-radius:18px;display:grid;place-items:center;flex:none}
+  .hero .face svg{width:30px;height:30px}
+  .face.ok{background:var(--okbg);color:var(--ok)} .face.warn{background:var(--warnbg);color:var(--warn)}
+  .face.bad{background:var(--badbg);color:var(--bad)} .face.idle{background:#eef1f7;color:var(--faint)}
+  .hero .txt{flex:1;min-width:240px}
+  .hero h2{font-size:21px;font-weight:800;letter-spacing:-.01em;margin-bottom:5px}
+  .hero p{font-size:13.5px;color:var(--sub);line-height:1.65}
+  .hero p b{color:var(--ink)}
+
+  .stats{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin-bottom:14px}
+  .stat{background:var(--card);border:1px solid var(--line);border-radius:var(--r-md);
+    padding:14px 16px;box-shadow:var(--shadow)}
+  .stat .lab{display:flex;align-items:center;gap:7px;font-size:12px;color:var(--sub);font-weight:650;margin-bottom:7px}
+  .stat .lab svg{width:14px;height:14px;color:var(--accent)}
+  .stat .val{font-size:19px;font-weight:750}
+
+  .card{background:var(--card);border:1px solid var(--line);border-radius:var(--r-lg);
+    padding:18px 20px;box-shadow:var(--shadow);margin-bottom:14px}
+  .card h3{font-size:14px;font-weight:700;display:flex;align-items:center;gap:8px;margin-bottom:12px}
+  .card h3 svg{width:15px;height:15px;color:var(--accent)}
+
+  .egress{display:flex;align-items:center;gap:11px;padding:10px 2px;border-bottom:1px dashed var(--line);font-size:13.5px}
+  .egress:last-child{border-bottom:none}
+  .egress svg{width:16px;height:16px;color:var(--sub);flex:none}
+  .egress .name{font-weight:650;flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .egress .name small{display:block;font-weight:500;color:var(--faint);font-size:11.5px}
+  .tag{font-size:11px;font-weight:700;padding:3.5px 9px;border-radius:999px;flex:none}
+  .tag.ok{background:var(--okbg);color:var(--ok)} .tag.err{background:var(--badbg);color:var(--bad)}
+  .tag.warn{background:var(--warnbg);color:var(--warn)} .tag.idle{background:#f0f2f7;color:var(--faint)}
+  .tag.use{background:var(--infobg);color:var(--info)}
+
+  button{display:inline-flex;align-items:center;gap:7px;font:inherit;font-size:13px;font-weight:650;
+    padding:9.5px 16px;border-radius:12px;border:1px solid var(--line);cursor:pointer;
+    background:var(--card);color:var(--ink);transition:.16s}
+  button svg{width:15px;height:15px}
+  button:hover{border-color:#cdd4e2;transform:translateY(-1px);box-shadow:0 4px 12px rgba(16,24,40,.08)}
+  button.primary{background:linear-gradient(135deg,var(--accent),var(--accent2));color:#fff;border:none;
+    box-shadow:0 6px 16px rgba(79,107,240,.35)}
+  button.danger{color:var(--bad);border-color:#f2d4d5}
+  select{font:inherit;font-size:12.5px;font-weight:600;padding:8px 11px;border-radius:11px;
+    border:1px solid var(--line);background:var(--card)}
+  .actions{display:flex;gap:10px;flex-wrap:wrap;margin-top:14px}
+
+  details{border:1px solid var(--line);border-radius:var(--r-lg);background:var(--card);
+    box-shadow:var(--shadow);margin-bottom:14px;overflow:hidden}
+  summary{cursor:pointer;padding:15px 20px;font-size:13.5px;font-weight:700;color:var(--sub);
+    list-style:none;display:flex;align-items:center;gap:8px;user-select:none}
+  summary::-webkit-details-marker{display:none}
+  summary svg{width:15px;height:15px;color:var(--accent)}
+  summary .chev{margin-left:auto;transition:.2s;color:var(--faint)}
+  details[open] summary .chev{transform:rotate(90deg)}
+  .details-body{padding:0 20px 18px}
+  .kv .row{display:flex;justify-content:space-between;gap:12px;font-size:13px;
+    border-bottom:1px dashed var(--line);padding:8px 0}
+  .kv .row:last-child{border-bottom:none}
+  .kv .k{color:var(--sub)} .kv .v{font-weight:650;text-align:right;word-break:break-all}
+  .kv .v.mono{font-family:var(--mono);font-size:12px;font-weight:600}
+
+  .obs-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:12px}
+  .obs-col{background:#f8f9fd;border:1px solid var(--line);border-radius:var(--r-md);padding:12px 14px}
+  .obs-col h4{font-size:12px;color:var(--sub);font-weight:700;margin-bottom:8px}
+  .obs-row{display:flex;justify-content:space-between;font-size:12.5px;padding:4px 0;border-bottom:1px dashed var(--line)}
+  .obs-row:last-child{border-bottom:none}
+  .obs-row .k{color:var(--sub)} .obs-row .v{font-weight:650}
+  .obs-model{font-family:var(--mono);font-size:11px}
+
+  .console{background:#101422;border-radius:var(--r-md);padding:12px 15px;max-height:240px;overflow:auto;
+    font-family:var(--mono);font-size:11.5px;line-height:1.8;color:#ccd4e8}
+  .console .t{color:#5b6480;margin-right:7px}
+  .console .w{color:#f0b860} .console .e{color:#f28b8d} .console .g{color:#7dd8a8}
+
+  footer{margin-top:18px;color:var(--faint);font-size:12px;line-height:1.7;display:flex;
+    justify-content:space-between;gap:12px;flex-wrap:wrap}
+  .hidden{display:none}
+  @media (max-width:680px){.stats{grid-template-columns:1fr 1fr}.obs-grid{grid-template-columns:1fr}}
+</style>
+</head>
+<body>
+<div class="app">
+
+  <header class="fade">
+    <div class="brand">
+      <div class="logo"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8Z"/></svg></div>
+      <div>
+        <h1>ccodex <em>sleep plus</em></h1>
+        <p>Codex 降智防护 · 本地工具</p>
+      </div>
+    </div>
+    <div style="display:flex;gap:8px;flex-wrap:wrap">
+      <span id="p-gw" class="pill"><span class="dot"></span><span id="p-gw-t">连接中…</span></span>
+      <span id="p-link" class="pill"><span class="dot"></span><span id="p-link-t">Codex …</span></span>
+    </div>
+  </header>
+
+  <section class="hero fade" id="hero">
+    <div class="face idle" id="hero-face">
+      <svg id="hero-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 8v4"/><path d="M12 16h.01"/></svg>
+    </div>
+    <div class="txt">
+      <h2 id="hero-title">正在检查…</h2>
+      <p id="hero-desc">等待服务数据。</p>
+    </div>
+    <button class="primary" id="btn-check">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 3h6l1 4h4v14H4V7h4z"/><circle cx="12" cy="13" r="3"/></svg>
+      重新体检
+    </button>
+  </section>
+
+  <section class="stats fade">
+    <div class="stat"><div class="lab"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 13c0 5-3.5 7.5-7.66 8.95a1 1 0 0 1-.67-.01C7.5 20.5 4 18 4 13V6a1 1 0 0 1 1-1c2 0 4.5-1.2 6.24-2.72a1.17 1.17 0 0 1 1.52 0C14.51 3.81 17 5 19 5a1 1 0 0 1 1 1z"/><path d="m9 12 2 2 4-4"/></svg>防护状态</div><div class="val" id="s-protect">—</div></div>
+    <div class="stat"><div class="lab"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>已转发请求</div><div class="val" id="s-req">0</div></div>
+    <div class="stat"><div class="lab"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="5"/><circle cx="12" cy="12" r="1"/></svg>体检次数</div><div class="val" id="s-probe">0</div></div>
+  </section>
+
+  <div class="card fade">
+    <h3><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M3 12h18"/><path d="M12 3a15 15 0 0 1 0 18 15 15 0 0 1 0-18z"/></svg>网络出口（换节点后点「重新体检」对比结果）</h3>
+    <div id="egresses"></div>
+  </div>
+
+  <details class="fade">
+    <summary>
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09a1.65 1.65 0 0 0-1-1.51 1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09a1.65 1.65 0 0 0 1.51-1 1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33h0a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51h0a1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82v0a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+      高级设置与详细信息
+      <svg class="chev" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 18 15 12 9 6"/></svg>
+    </summary>
+    <div class="details-body">
+      <div class="kv" id="state-info"></div>
+      <div class="kv" id="session-info" style="margin-top:10px"></div>
+      <div class="actions">
+        <button id="btn-toggle"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18.36 6.64a9 9 0 1 1-12.73 0"/><line x1="12" y1="2" x2="12" y2="11"/></svg><span id="btn-toggle-t">关闭注入</span></button>
+        <button id="btn-probe"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-2.64-6.36"/><polyline points="21 3 21 9 15 9"/></svg>只采 state</button>
+        <select id="sel-fallback" title="没有合格 state 时的行为">
+          <option value="passthrough">无 state 时：正常转发（推荐）</option>
+          <option value="strict">无 state 时：暂停并提示</option>
+        </select>
+        <select id="sel-plan" title="账号类型（影响 state 形状规则）">
+          <option value="auto">账号：自动识别</option>
+          <option value="personal">个人</option>
+          <option value="team">Team</option>
+        </select>
+      </div>
+
+      <h3 style="margin:18px 0 10px;font-size:13px;color:var(--sub)">效果观测（注入开 vs 关，自动记录你的真实请求）</h3>
+      <div class="obs-grid">
+        <div class="obs-col"><h4>注入开启</h4><div id="obs-on"></div></div>
+        <div class="obs-col"><h4>注入关闭</h4><div id="obs-off"></div></div>
+      </div>
+      <p style="font-size:11.5px;color:var(--faint);margin-bottom:14px" id="obs-note"></p>
+
+      <h3 style="margin:6px 0 10px;font-size:13px;color:var(--sub)">运行日志</h3>
+      <div class="console" id="log">等待数据…</div>
+    </div>
+  </details>
+
+  <footer class="fade">
+    <div>思路来自社区，不保证效果；体检/采集会消耗少量额度。<br>
+      取消接管 Codex：右键托盘图标 →「恢复 Codex 配置」，或运行 <code>ccodex-sleep-plus.exe stop</code></div>
+    <button class="danger" id="btn-restore"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12a9 9 0 1 0 3-6.7L3 8"/><polyline points="3 3 3 8 8 8"/></svg>恢复 Codex 配置</button>
+  </footer>
+</div>
+
+<script>
+const KEY = new URLSearchParams(location.search).get('key') || '';
+const Q = KEY ? ('?key=' + encodeURIComponent(KEY)) : '';
+const $ = id => document.getElementById(id);
+const ICONS = {
+  ok:   '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 13c0 5-3.5 7.5-7.66 8.95a1 1 0 0 1-.67-.01C7.5 20.5 4 18 4 13V6a1 1 0 0 1 1-1c2 0 4.5-1.2 6.24-2.72a1.17 1.17 0 0 1 1.52 0C14.51 3.81 17 5 19 5a1 1 0 0 1 1 1z"/><path d="m9 12 2 2 4-4"/></svg>',
+  warn: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><path d="M12 9v4"/><path d="M12 17h.01"/></svg>',
+  bad:  '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="m15 9-6 6"/><path d="m9 9 6 6"/></svg>',
+  idle: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 8v4"/><path d="M12 16h.01"/></svg>'
+};
+
+function pill(el, text, cls){ el.className = 'pill ' + (cls||''); $(el.id + '-t').textContent = text; }
+
+async function poll(){
+  try{
+    const r = await fetch('/panel/api/status' + Q, {cache:'no-store'});
+    if(!r.ok) throw new Error(r.status);
+    render(await r.json());
+  }catch(e){ pill($('p-gw'), '服务未运行', 'bad'); }
+  setTimeout(poll, 2000);
+}
+
+function setHero(cls, title, desc){
+  $('hero-face').className = 'face ' + cls;
+  $('hero-icon').outerHTML = (ICONS[cls] || ICONS.idle).replace('<svg ', '<svg id="hero-icon" ');
+  $('hero-title').textContent = title;
+  $('hero-desc').innerHTML = desc;
+}
+
+function render(s){
+  pill($('p-gw'), '后台运行中', 'ok');
+  pill($('p-link'), s.codex_linked ? '已接管 Codex' : '未接管 Codex', s.codex_linked ? 'ok' : 'warn');
+  $('s-req').textContent = s.requests_total;
+  $('s-probe').textContent = s.probes_total;
+
+  // ---- 主状态：体检优先，其次防护状态 ----
+  const eg = s.egresses || [];
+  const best = eg.filter(e => e.quality === 'healthy');
+  const degraded = eg.filter(e => e.quality === 'degraded' || e.quality === 'severely');
+  const sess = (s.sessions||[])[0];
+  const protecting = s.injection_enabled && s.codex_linked;
+
+  if (best.length){
+    setHero('ok', '当前节点：未发现降智',
+      `体检回答为 <b>iPhone 17</b>（满血档）。防护${protecting ? '开启中' : '已关闭'}。` +
+      `可正常使用；感觉异常时随时点「重新体检」。`);
+  } else if (degraded.length){
+    const d = degraded[0];
+    setHero(d.quality === 'severely' ? 'bad' : 'warn',
+      d.quality === 'severely' ? '当前节点：严重降智' : '当前节点：疑似降智',
+      `体检回答为 <b>${d.quality_answer || 'iPhone 16'}</b>（降智档）。` +
+      `建议：<b>在代理软件里切换一个节点，然后点「重新体检」</b>，直到显示满血。`);
+  } else {
+    setHero('idle', '还没有体检数据',
+      `点右上角「<b>重新体检</b>」测一次（每个出口 1 条极短消息，消耗少量额度），` +
+      `即可知道当前节点是否被降智。`);
+  }
+  $('s-protect').textContent = protecting ? (sess && sess.state.usable ? '防护中' : '待命中') : '已关闭';
+
+  // ---- 出口列表 ----
+  const QMAP = {healthy:['满血','ok'], degraded:['降智','err'], severely:['严重降智','err'], unknown:['未测','idle']};
+  $('egresses').innerHTML = eg.map(e=>{
+    const q = QMAP[e.quality] || QMAP.unknown;
+    const qtag = e.quality && e.quality !== 'unknown' ? `<span class="tag ${q[1]}">${q[0]}</span>` : '';
+    const conn = e.last_error ? '<span class="tag err">连不上</span>'
+      : e.last_ok ? '<span class="tag ok">可用</span>' : '<span class="tag idle">未使用</span>';
+    const using = sess && sess.state.usable && e.id === sess.state_egress ? ' <span class="tag use">使用中</span>' : '';
+    return `<div class="egress">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M3 12h18"/><path d="M12 3a15 15 0 0 1 0 18 15 15 0 0 1 0-18z"/></svg>
+      <div class="name">${e.label}<small>${e.uses} 次使用${e.quality_answer ? ' · 答过: ' + e.quality_answer : ''}</small></div>
+      ${qtag}${conn}${using}</div>`;
+  }).join('') || '<p style="font-size:13px;color:var(--faint)">未发现网络出口</p>';
+
+  // ---- 高级区 ----
+  const st = sess ? sess.state : null;
+  const rows = [];
+  if (st){
+    rows.push(['state 状态', st.usable ? `可用（剩 ${Math.floor(st.remaining/60)} 分钟）` : '暂无可用'],
+      ['密文块数', st.usable ? `${st.blocks} 块（规则 ${ (st.expected_blocks||[]).join('/') }）` : '—'],
+      ['实例池', st.pool_size ? `备用 ${st.pool_size} 个` : '仅主用'],
+      ['指纹', st.fingerprint ? `<span class="mono">${st.fingerprint}</span>` : '—']);
+  }
+  if (sess){
+    rows.push(['模型', sess.model], ['上次采集', sess.last_probe_result || '—'],
+      ['账号规则', sess.plan === 'team' ? 'Team' : '个人' + (s.account_mode==='auto' ? '（自动）' : '（手动）')]);
+  }
+  $('state-info').innerHTML = rows.map(([k,v]) =>
+    `<div class="row"><span class="k">${k}</span><span class="v">${v}</span></div>`).join('');
+
+  $('btn-toggle-t').textContent = s.injection_enabled ? '关闭注入' : '开启注入';
+  $('sel-fallback').value = s.fallback; $('sel-plan').value = s.account_mode;
+
+  const renderObs = (el, g) => {
+    if(!g || !g.n){ el.innerHTML = '<div class="obs-row"><span class="k">暂无样本</span><span class="v"></span></div>'; return; }
+    const models = (g.models||[]).map(m =>
+      `<div class="obs-row"><span class="k obs-model">${m.model||'—'}</span><span class="v">${m.count} 次</span></div>`).join('');
+    el.innerHTML = `<div class="obs-row"><span class="k">样本</span><span class="v">${g.n}</span></div>` + models +
+      `<div class="obs-row"><span class="k">平均输出 tokens</span><span class="v">${g.avg_out_tokens||'—'}</span></div>
+       <div class="obs-row"><span class="k">平均推理 tokens</span><span class="v">${g.avg_reason_tokens||'—'}</span></div>`;
+  };
+  if(s.observations){
+    renderObs($('obs-on'), s.observations.on);
+    renderObs($('obs-off'), s.observations.off);
+    $('obs-note').textContent = s.observations.note || '';
+  }
+
+  const log = $('log');
+  log.innerHTML = (s.log_tail||[]).slice(-100).map(l=>{
+    let cls = '';
+    if(l.includes('[warn')) cls='w'; else if(l.includes('[error')) cls='e';
+    else if(l.includes('accepted')||l.includes('healthy')) cls='g';
+    const sp = l.indexOf(' ');
+    return `<div><span class="t">${l.slice(0,sp)}</span><span class="${cls}">${l.slice(sp+1)}</span></div>`;
+  }).join('');
+  log.scrollTop = log.scrollHeight;
+}
+
+async function act(body){
+  const r = await fetch('/panel/api/action' + Q,
+    {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)});
+  const j = await r.json().catch(()=>({}));
+  if(!j.ok && j.error) alert(j.error);
+}
+$('btn-check').onclick = () => act({action:'egress_check'});
+$('btn-probe').onclick = () => act({action:'probe_now'});
+$('btn-toggle').onclick = () => act({action:'toggle_injection'});
+$('btn-restore').onclick = () => { if(confirm('恢复 Codex 原始配置？（工具将不再接管 Codex）')) act({action:'restore_config'}); };
+$('sel-fallback').onchange = e => act({action:'set_fallback', mode:e.target.value});
+$('sel-plan').onchange = e => act({action:'set_account_mode', mode:e.target.value});
+
+poll();
+</script>
+</body>
+</html>

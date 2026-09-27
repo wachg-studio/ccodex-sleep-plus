@@ -1022,6 +1022,32 @@ class Engine:
         }
 
 
+def _strip_managed_block(text: str) -> str:
+    """删除 managed provider 块与标记注释；按表头定位，不依赖标记注释存在。"""
+    lines = text.splitlines(keepends=True)
+    out, i = [], 0
+    while i < len(lines):
+        stripped = lines[i].strip()
+        if stripped == MANAGED_MARK or stripped == "# restore: python sleep_plus.py restore":
+            i += 1
+            continue
+        if re.match(r"\s*\[model_providers\." + re.escape(PROVIDER_ID) + r"\]", lines[i]):
+            i += 1
+            while i < len(lines):
+                s = lines[i].strip()
+                if lines[i].lstrip().startswith("["):
+                    break
+                if s in (MANAGED_MARK, "# restore: python sleep_plus.py restore") \
+                        or ("managed by ccodex-sleep-plus" in s and s.startswith("#")):
+                    i += 1
+                    continue
+                i += 1
+            continue
+        out.append(lines[i])
+        i += 1
+    return "".join(out).rstrip("\r\n") + "\n"
+
+
 # ---------------------------------------------------------------- 配置接管 --
 def _top_level_insert(text: str, line: str):
     """把顶层键插入到第一个 table 头之前；若已存在则替换。返回 (new_text, old_line)。"""
@@ -1057,15 +1083,27 @@ def install_provider(port=LISTEN_PORT, model=None):
         doc = tomllib.loads(text)
         managed = (doc.get("model_providers") or {}).get(PROVIDER_ID)
 
-    if managed is None:
-        backup = path.with_name(f"config.toml.bak-before-sleep-plus-{time.strftime('%Y%m%d-%H%M%S')}")
-        if not any(path.parent.glob("config.toml.bak-before-sleep-plus-*")):
+    # 备份定位（全防御：任何异常都降级为新建备份，绝不因备份问题中断接管）
+    backup = None
+    try:
+        existing = sorted(path.parent.glob("config.toml.bak-before-sleep-plus-*"))
+        if managed is None and not existing:
+            backup = path.with_name(
+                f"config.toml.bak-before-sleep-plus-{time.strftime('%Y%m%d-%H%M%S')}")
             shutil.copy2(path, backup)
-        else:
-            backup = sorted(path.parent.glob("config.toml.bak-before-sleep-plus-*"))[-1]
-    else:
-        backup = sorted(path.parent.glob("config.toml.bak-before-sleep-plus-*"))[-1] if any(
-            path.parent.glob("config.toml.bak-before-sleep-plus-*")) else None
+        elif existing:
+            backup = existing[-1]
+    except Exception as e:
+        log("backup_locate_failed", level="warn", err=str(e)[:120])
+        backup = None
+    if managed is None and backup is None:
+        # 仍无备份（如备份目录不可写）——强制新建一次，失败则放弃接管而不是崩溃
+        try:
+            backup = path.with_name(
+                f"config.toml.bak-before-sleep-plus-{time.strftime('%Y%m%d-%H%M%S')}")
+            shutil.copy2(path, backup)
+        except Exception as e:
+            return {"ok": False, "error": f"无法创建配置备份，已放弃接管: {e}"}
 
     base_url = f"http://{LISTEN_HOST}:{port}/backend-api/codex"
     if managed is not None and managed.get("base_url") == base_url and \
@@ -1087,9 +1125,8 @@ def install_provider(port=LISTEN_PORT, model=None):
     except Exception:
         pass
 
-    # 移除旧的 managed 块再追加新的（幂等）
-    if MANAGED_MARK in text:
-        text = text.split(MANAGED_MARK)[0].rstrip("\r\n") + "\n"
+    # 移除旧的 managed 块再追加新的（幂等；不依赖标记注释）
+    text = _strip_managed_block(text)
     block = (
         f"\n{MANAGED_MARK}\n"
         f"# restore: python sleep_plus.py restore\n"
@@ -1125,7 +1162,7 @@ def restore_provider():
     text = path.read_text(encoding="utf8")
     changed = False
     if MANAGED_MARK in text:
-        text = text.split(MANAGED_MARK)[0].rstrip("\r\n") + "\n"
+        text = _strip_managed_block(text)
         changed = True
     # 移除顶层 model_provider = "sleep-plus"
     lines = text.splitlines(keepends=True)
@@ -1239,7 +1276,7 @@ class Gateway(BaseHTTPRequestHandler):
             if not self._key_ok():
                 self._fail(403, "bad_key", "面板访问受限：请从托盘图标右键菜单重新打开面板")
                 return
-            body = PANEL_HTML.encode("utf8")
+            body = _panel_html().encode("utf8")
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.send_header("Cache-Control", "no-store")
@@ -1538,373 +1575,16 @@ def make_server(engine: Engine, port: int, strict: bool = False):
 
 
 # ---------------------------------------------------------------- 面板 --------
-PANEL_HTML = r"""<!doctype html>
-<html lang="zh-CN">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>ccodex sleep plus · 状态面板</title>
-<style>
-  :root{
-    --bg:#f4f6fb; --card:#ffffff; --ink:#181b22; --sub:#5f6672; --faint:#9aa1ad;
-    --line:#e8ebf2; --accent:#4f6bf0; --accent2:#8b5cf6;
-    --ok:#14a35c; --okbg:#e8f8f0; --warn:#c07a10; --warnbg:#fdf3e2;
-    --bad:#d6484b; --badbg:#fdebec; --info:#2f6fdb; --infobg:#e9f0fe;
-    --mono:ui-monospace,'Cascadia Code',Consolas,monospace;
-    --r-lg:20px; --r-md:14px; --r-sm:11px;
-    --shadow:0 1px 2px rgba(16,24,40,.05),0 10px 30px rgba(16,24,40,.06);
-  }
-  *{box-sizing:border-box;margin:0;padding:0}
-  html,body{height:100%}
-  body{
-    font-family:system-ui,-apple-system,'Segoe UI','PingFang SC','Microsoft YaHei',sans-serif;
-    background:
-      radial-gradient(900px 340px at 85% -60px, rgba(139,92,246,.10), transparent 60%),
-      radial-gradient(700px 300px at -10% -40px, rgba(79,107,240,.12), transparent 55%),
-      var(--bg);
-    color:var(--ink); -webkit-font-smoothing:antialiased; padding:28px 20px 48px;
-  }
-  .app{max-width:1060px;margin:0 auto}
-  .fade{animation:fadeUp .45s cubic-bezier(.22,.9,.3,1) both}
-  @keyframes fadeUp{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:none}}
+def _panel_html() -> str:
+    """面板页面：独立 panel.html 资源（源码目录或 PyInstaller 解包目录）。"""
+    base = Path(getattr(sys, "_MEIPASS", "")) if getattr(sys, "frozen", False) else Path(__file__).parent
+    for cand in (base / "panel.html", Path(__file__).parent / "panel.html"):
+        if cand.exists():
+            return cand.read_text(encoding="utf8")
+    return ("<html><body style=\"font-family:system-ui;padding:40px;color:#5f6672\">"
+            "面板资源缺失（panel.html），请重新安装。</body></html>")
 
-  header{display:flex;align-items:center;justify-content:space-between;gap:16px;margin-bottom:22px;flex-wrap:wrap}
-  .brand{display:flex;align-items:center;gap:14px}
-  .logo{width:46px;height:46px;border-radius:15px;display:grid;place-items:center;color:#fff;
-    background:linear-gradient(135deg,var(--accent),var(--accent2));
-    box-shadow:0 8px 20px rgba(79,107,240,.35)}
-  .logo svg{width:24px;height:24px}
-  .brand h1{font-size:19px;font-weight:700;letter-spacing:-.01em}
-  .brand h1 em{font-style:normal;color:var(--accent)}
-  .brand p{font-size:12.5px;color:var(--sub);margin-top:2px}
-  .pills{display:flex;gap:8px;flex-wrap:wrap}
-  .pill{display:inline-flex;align-items:center;gap:7px;font-size:12.5px;font-weight:600;
-    padding:7px 13px;border-radius:999px;background:var(--card);border:1px solid var(--line);
-    box-shadow:0 1px 2px rgba(16,24,40,.04);color:var(--sub)}
-  .dot{width:8px;height:8px;border-radius:50%;background:var(--faint);flex:none}
-  .pill.ok{background:var(--okbg);border-color:#cdeeda;color:var(--ok)}
-  .pill.ok .dot{background:var(--ok);box-shadow:0 0 0 0 rgba(20,163,92,.5);animation:pulse 2s infinite}
-  .pill.bad{background:var(--badbg);border-color:#f6d3d4;color:var(--bad)}
-  .pill.bad .dot{background:var(--bad)}
-  .pill.info{background:var(--infobg);border-color:#d5e3fc;color:var(--info)}
-  .pill.info .dot{background:var(--info)}
-  @keyframes pulse{70%{box-shadow:0 0 0 7px rgba(20,163,92,0)}100%{box-shadow:0 0 0 0 rgba(20,163,92,0)}}
 
-  .stats{display:grid;grid-template-columns:repeat(4,1fr);gap:14px;margin-bottom:16px}
-  .stat{background:var(--card);border:1px solid var(--line);border-radius:var(--r-md);
-    padding:15px 17px;box-shadow:var(--shadow);display:flex;flex-direction:column;gap:8px}
-  .stat .lab{display:flex;align-items:center;gap:8px;font-size:12.5px;color:var(--sub);font-weight:600}
-  .stat .lab svg{width:15px;height:15px;color:var(--accent);flex:none}
-  .stat .val{font-size:23px;font-weight:750;letter-spacing:-.02em}
-  .stat .val small{font-size:13px;color:var(--faint);font-weight:500;margin-left:3px}
-
-  .grid{display:grid;grid-template-columns:5fr 4fr;gap:16px}
-  .card{background:var(--card);border:1px solid var(--line);border-radius:var(--r-lg);
-    padding:20px;box-shadow:var(--shadow)}
-  .card h2{font-size:14.5px;font-weight:700;display:flex;align-items:center;gap:9px;margin-bottom:4px}
-  .card h2 svg{width:16px;height:16px;color:var(--accent)}
-  .card .desc{font-size:12px;color:var(--faint);margin-bottom:14px}
-  .full{grid-column:1 / -1}
-
-  .state-layout{display:grid;grid-template-columns:auto 1fr;gap:22px;align-items:center}
-  .ringwrap{position:relative;width:132px;height:132px}
-  .ringwrap svg{transform:rotate(-90deg)}
-  .ring-bg{fill:none;stroke:#edf0f7;stroke-width:10}
-  .ring-fg{fill:none;stroke:url(#grad);stroke-width:10;stroke-linecap:round;transition:stroke-dashoffset .8s ease}
-  .ring-center{position:absolute;inset:0;display:grid;place-content:center;text-align:center;gap:1px}
-  .ring-center b{font-size:21px;font-weight:750;font-variant-numeric:tabular-nums}
-  .ring-center span{font-size:11px;color:var(--faint)}
-  .kv{display:flex;flex-direction:column;gap:9px}
-  .kv .row{display:flex;justify-content:space-between;gap:12px;font-size:13px;
-    border-bottom:1px dashed var(--line);padding-bottom:8px}
-  .kv .row:last-child{border-bottom:none;padding-bottom:0}
-  .kv .k{color:var(--sub)}
-  .kv .v{font-weight:650;text-align:right;word-break:break-all}
-  .kv .v.mono{font-family:var(--mono);font-size:12.5px;font-weight:600}
-
-  .egress{display:flex;align-items:center;gap:11px;padding:11px 4px;border-bottom:1px dashed var(--line);font-size:13px}
-  .egress:last-of-type{border-bottom:none}
-  .egress svg{width:16px;height:16px;color:var(--sub);flex:none}
-  .egress .name{font-weight:650;flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-  .egress .name small{display:block;font-weight:500;color:var(--faint);font-size:11.5px}
-  .tag{font-size:11px;font-weight:700;padding:3.5px 9px;border-radius:999px;flex:none}
-  .tag.ok{background:var(--okbg);color:var(--ok)} .tag.err{background:var(--badbg);color:var(--bad)}
-  .tag.idle{background:#f0f2f7;color:var(--faint)} .tag.use{background:var(--infobg);color:var(--info)}
-
-  .actions{display:flex;gap:10px;flex-wrap:wrap;margin-top:16px}
-  button{display:inline-flex;align-items:center;gap:7px;font:inherit;font-size:13px;font-weight:650;
-    padding:9.5px 16px;border-radius:var(--r-sm);border:1px solid var(--line);cursor:pointer;
-    background:var(--card);color:var(--ink);transition:.16s}
-  button svg{width:15px;height:15px}
-  button:hover{border-color:#cdd4e2;transform:translateY(-1px);box-shadow:0 4px 12px rgba(16,24,40,.08)}
-  button:active{transform:none}
-  button.primary{background:linear-gradient(135deg,var(--accent),var(--accent2));color:#fff;border:none;
-    box-shadow:0 6px 16px rgba(79,107,240,.35)}
-  button.primary:hover{filter:brightness(1.06)}
-  button.danger{color:var(--bad);border-color:#f2d4d5}
-  select{font:inherit;font-size:13px;font-weight:600;padding:9px 12px;border-radius:var(--r-sm);
-    border:1px solid var(--line);background:var(--card);color:var(--ink)}
-
-  .console{background:#101422;border-radius:var(--r-md);padding:14px 16px;max-height:270px;overflow:auto;
-    font-family:var(--mono);font-size:12px;line-height:1.85;color:#ccd4e8}
-  .console .t{color:#5b6480;margin-right:8px}
-  .console .w{color:#f0b860} .console .e{color:#f28b8d} .console .g{color:#7dd8a8}
-
-  .obs-grid{display:grid;grid-template-columns:1fr 1fr;gap:14px}
-  .obs-col{background:#f8f9fd;border:1px solid var(--line);border-radius:var(--r-md);padding:14px 16px}
-  .obs-col h3{font-size:12.5px;color:var(--sub);font-weight:700;margin-bottom:10px;display:flex;align-items:center;gap:6px}
-  .obs-col h3 .dot{width:7px;height:7px;border-radius:50%;background:var(--accent)}
-  .obs-row{display:flex;justify-content:space-between;font-size:12.5px;padding:5px 0;border-bottom:1px dashed var(--line)}
-  .obs-row:last-child{border-bottom:none}
-  .obs-row .k{color:var(--sub)} .obs-row .v{font-weight:650;font-variant-numeric:tabular-nums}
-  .obs-model{font-family:var(--mono);font-size:11.5px}
-
-  footer{margin-top:22px;display:flex;justify-content:space-between;gap:14px;flex-wrap:wrap;
-    color:var(--faint);font-size:12px;line-height:1.7}
-  @media (max-width:820px){.stats{grid-template-columns:repeat(2,1fr)}.grid{grid-template-columns:1fr}}
-</style>
-</head>
-<body>
-<svg width="0" height="0" style="position:absolute"><defs>
-  <linearGradient id="grad" x1="0" y1="0" x2="1" y2="1">
-    <stop offset="0" stop-color="#4f6bf0"/><stop offset="1" stop-color="#8b5cf6"/>
-  </linearGradient>
-</defs></svg>
-
-<div class="app">
-  <header class="fade">
-    <div class="brand">
-      <div class="logo"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8Z"/></svg></div>
-      <div>
-        <h1>ccodex <em>sleep plus</em></h1>
-        <p>turn-state 本地网关 · 增强版</p>
-      </div>
-    </div>
-    <div class="pills">
-      <span id="p-gw" class="pill"><span class="dot"></span><span id="p-gw-t">连接中…</span></span>
-      <span id="p-link" class="pill info"><span class="dot"></span><span id="p-link-t">Codex …</span></span>
-      <span id="p-inj" class="pill ok"><span class="dot"></span><span id="p-inj-t">注入 …</span></span>
-    </div>
-  </header>
-
-  <section class="stats fade">
-    <div class="stat"><div class="lab"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 13c0 5-3.5 7.5-7.66 8.95a1 1 0 0 1-.67-.01C7.5 20.5 4 18 4 13V6a1 1 0 0 1 1-1c2 0 4.5-1.2 6.24-2.72a1.17 1.17 0 0 1 1.52 0C14.51 3.81 17 5 19 5a1 1 0 0 1 1 1z"/><path d="m9 12 2 2 4-4"/></svg>state 状态</div><div class="val" id="s-state">—</div></div>
-    <div class="stat"><div class="lab"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><polyline points="12 7 12 12 15.2 14"/></svg>有效期剩余</div><div class="val" id="s-ttl">—</div></div>
-    <div class="stat"><div class="lab"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>转发请求</div><div class="val" id="s-req">0<small>次</small></div></div>
-    <div class="stat"><div class="lab"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="5"/><circle cx="12" cy="12" r="1"/></svg>探测次数</div><div class="val" id="s-probe">0<small>次</small></div></div>
-  </section>
-
-  <section class="grid">
-    <div class="card fade">
-      <h2><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><ellipse cx="12" cy="5" rx="8" ry="3"/><path d="M4 5v14c0 1.66 3.58 3 8 3s8-1.34 8-3V5"/><path d="M4 12c0 1.66 3.58 3 8 3s8-1.34 8-3"/></svg>Turn-State</h2>
-      <p class="desc">按账号规则采集与注入；块数/长度是社区经验规则，不代表模型质量。</p>
-      <div class="state-layout">
-        <div class="ringwrap">
-          <svg width="132" height="132" viewBox="0 0 132 132">
-            <circle class="ring-bg" cx="66" cy="66" r="56"/>
-            <circle id="ring" class="ring-fg" cx="66" cy="66" r="56" stroke-dasharray="351.9" stroke-dashoffset="351.9"/>
-          </svg>
-          <div class="ring-center"><b id="ttl-big">--:--</b><span>剩余有效期</span></div>
-        </div>
-        <div class="kv">
-          <div class="row"><span class="k">指纹</span><span class="v mono" id="v-fp">—</span></div>
-          <div class="row"><span class="k">密文块数</span><span class="v" id="v-blocks">—</span></div>
-          <div class="row"><span class="k">账号规则</span><span class="v" id="v-plan">—</span></div>
-          <div class="row"><span class="k">采集出口</span><span class="v" id="v-egress">—</span></div>
-          <div class="row"><span class="k">实例池</span><span class="v" id="v-backup">—</span></div>
-          <div class="row"><span class="k">上次采集</span><span class="v" id="v-last">—</span></div>
-        </div>
-      </div>
-      <div class="actions">
-        <button class="primary" id="btn-probe"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-2.64-6.36"/><polyline points="21 3 21 9 15 9"/></svg>立即采集</button>
-        <button id="btn-toggle"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18.36 6.64a9 9 0 1 1-12.73 0"/><line x1="12" y1="2" x2="12" y2="11"/></svg><span id="btn-toggle-t">关闭注入</span></button>
-        <button class="danger" id="btn-clear"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18"/><path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/></svg>清除 state</button>
-      </div>
-    </div>
-
-    <div class="card fade">
-      <h2><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M3 12h18"/><path d="M12 3a15 15 0 0 1 0 18 15 15 0 0 1 0-18z"/></svg>出口路由</h2>
-      <p class="desc">探测与转发使用的网络出口；state 与出口绑定使用。质量 = 知识探针判定（iPhone 档位）。</p>
-      <div id="egresses"></div>
-      <div class="actions">
-        <button id="btn-check"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 3h6l1 4h4v14H4V7h4z"/><circle cx="12" cy="13" r="3"/></svg>出口体检（每出口 1 次请求）</button>
-      </div>
-    </div>
-
-    <div class="card fade">
-      <h2><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="16" rx="3"/><path d="M7 9h.01M7 13h.01M11 9h6M11 13h4"/></svg>会话与策略</h2>
-      <p class="desc">凭据只保留在内存；按账号与模型隔离。</p>
-      <div class="kv" id="session-info"></div>
-      <div class="actions">
-        <select id="sel-fallback">
-          <option value="passthrough">兜底：普通转发（推荐）</option>
-          <option value="strict">严格：无 state 时 503</option>
-        </select>
-        <select id="sel-plan">
-          <option value="auto">账号规则：自动识别</option>
-          <option value="personal">个人（10 块）</option>
-          <option value="team">Team（12 块）</option>
-        </select>
-      </div>
-    </div>
-
-    <div class="card full fade">
-      <h2><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 3v18h18"/><path d="m19 9-5 5-4-4-3 3"/></svg>效果观测</h2>
-      <p class="desc" id="obs-note">旁路记录服务端自报的真实模型与用量，对比注入开/关是否带来可观测差异。</p>
-      <div class="obs-grid">
-        <div class="obs-col"><h3>注入开启</h3><div id="obs-on"></div></div>
-        <div class="obs-col"><h3>注入关闭</h3><div id="obs-off"></div></div>
-      </div>
-    </div>
-
-    <div class="card full fade">
-      <h2><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg>实时日志</h2>
-      <p class="desc">敏感值（令牌、完整 state）不写日志。每 2 秒自动刷新。</p>
-      <div class="console" id="log">等待数据…</div>
-    </div>
-  </section>
-
-  <footer class="fade">
-    <div>社区经验思路的独立增强实现，不保证效果；探测消耗真实额度。<br>
-      取消接入：<code>python sleep_plus.py restore</code> · 面板仅监听 127.0.0.1</div>
-    <button class="danger" id="btn-restore"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12a9 9 0 1 0 3-6.7L3 8"/><polyline points="3 3 3 8 8 8"/></svg>恢复 Codex 配置</button>
-  </footer>
-</div>
-
-<script>
-const KEY = new URLSearchParams(location.search).get('key') || '';
-const $ = id => document.getElementById(id);
-const CIRC = 351.9;
-let lastSessions = [];
-
-function fmt(sec){
-  if (sec == null || sec <= 0) return '--:--';
-  const m = Math.floor(sec/60), s = Math.floor(sec%60);
-  return String(m).padStart(2,'0') + ':' + String(s).padStart(2,'0');
-}
-function phaseText(p){
-  return {ready:'可用', collecting:'采集中', waiting:'等待采集', auth_blocked:'凭据被拒',
-          rate_limited:'上游限流', passthrough:'直通'}[p] || p;
-}
-function pill(el, text, cls){ el.className = 'pill ' + (cls||''); $(el.id + '-t').textContent = text; }
-
-async function poll(){
-  try{
-    const r = await fetch('/panel/api/status' + (KEY ? '?key=' + encodeURIComponent(KEY) : ''), {cache:'no-store'});
-    if(r.status===403){document.body.innerHTML='<div style="font-family:system-ui;padding:48px;text-align:center;color:#5f6672">面板访问受限<br><br>请从托盘图标右键菜单重新打开「打开状态面板」</div>';throw new Error(403);}
-    render(await r.json());
-  }catch(e){ pill($('p-gw'), '网关离线', 'bad'); }
-  setTimeout(poll, 2000);
-}
-
-function render(s){
-  pill($('p-gw'), '网关运行 · ' + s.listen, 'ok');
-  pill($('p-inj'), s.injection_enabled ? '注入已开启' : '注入已关闭', s.injection_enabled ? 'ok' : 'bad');
-  pill($('p-link'), s.codex_linked ? 'Codex 已接入' : 'Codex 未接入', s.codex_linked ? 'ok' : 'info');
-  $('s-req').innerHTML = s.requests_total + '<small>次</small>';
-  $('s-probe').innerHTML = s.probes_total + '<small>次</small>';
-
-  const sess = (s.sessions||[])[0];
-  const st = sess ? sess.state : null;
-  if(sess && st && st.usable){
-    $('s-state').textContent = '可用';
-    $('s-ttl').innerHTML = fmt(st.remaining) + '<small>后过期</small>';
-    $('ttl-big').textContent = fmt(st.remaining);
-    $('ring').style.strokeDashoffset = (CIRC * (1 - st.remaining / s.ttl)).toFixed(1);
-    $('v-fp').textContent = st.fingerprint || '—';
-    $('v-blocks').textContent = st.blocks + ' 块（规则 ' + (st.expected_blocks||[]).join('/') + ' 块'
-      + (st.strikes ? ' · ' + st.strikes + ' 次异常' : '') + '）';
-    $('v-egress').textContent = sess.state_egress || '—';
-    $('v-backup').textContent = st.pool_size ? '备用 ' + st.pool_size + ' 个' : '仅主用';
-  } else {
-    $('s-state').textContent = sess ? phaseText(sess.phase) : '无会话';
-    $('s-ttl').textContent = '--:--'; $('ttl-big').textContent = '--:--';
-    $('ring').style.strokeDashoffset = CIRC;
-    $('v-fp').textContent = '—'; $('v-blocks').textContent = '—';
-    $('v-egress').textContent = '—'; $('v-backup').textContent = '—';
-  }
-  if(sess){
-    $('v-plan').textContent = (sess.plan === 'team' ? 'Team（12/33 块）' : '个人（10/33 块）')
-      + (s.account_mode==='auto' ? ' · 自动' : ' · 手动');
-    $('v-last').textContent = (sess.last_probe_result || '—')
-      + (sess.next_probe_in ? ' · ' + fmt(sess.next_probe_in) + '后再试' : '');
-  }
-  $('btn-toggle-t').textContent = s.injection_enabled ? '关闭注入' : '开启注入';
-
-  const QMAP = {healthy:['满血','ok'], degraded:['降智','err'], severely:['严重降智','err'], unknown:['未测','idle']};
-  $('egresses').innerHTML = (s.egresses||[]).map(e=>{
-    const tag = e.last_error ? '<span class="tag err">失败</span>'
-      : e.last_ok ? '<span class="tag ok">可用</span>'
-      : '<span class="tag idle">未使用</span>';
-    const q = QMAP[e.quality] || QMAP.unknown;
-    const qtag = e.quality && e.quality !== 'unknown'
-      ? `<span class="tag ${q[1]}">${q[0]}</span>` : '';
-    const using = sess && sess.state.usable && e.id === sess.state_egress
-      ? ' <span class="tag use">使用中</span>' : '';
-    return `<div class="egress">
-      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M3 12h18"/><path d="M12 3a15 15 0 0 1 0 18 15 15 0 0 1 0-18z"/></svg>
-      <div class="name">${e.label}<small>${e.uses} 次使用${e.quality_answer ? ' · 探针答: ' + e.quality_answer : ''}${e.last_error ? ' · ' + e.last_error : ''}</small></div>
-      ${qtag}${tag}${using}</div>`;
-  }).join('') || '<p class="desc">未发现出口</p>';
-
-  const si = [];
-  if(sess){
-    si.push(['模型', sess.model], ['会话', sess.key + '…'],
-      ['状态', phaseText(sess.phase)],
-      ['观察到的块数', sess.observed_blocks ? sess.observed_blocks + ' 块' : '—']);
-    if(sess.limit_status) si.push(['上游限制', sess.limit_status + (sess.limit_wait ? ' · ' + sess.limit_wait + 's' : '')]);
-  } else si.push(['状态','等待第一条 Codex 请求']);
-  $('session-info').innerHTML = si.map(([k,v]) =>
-    `<div class="row"><span class="k">${k}</span><span class="v">${v}</span></div>`).join('');
-
-  $('sel-fallback').value = s.fallback; $('sel-plan').value = s.account_mode;
-
-  const renderObs = (el, g) => {
-    if(!g || !g.n){ el.innerHTML = '<div class="obs-row"><span class="k">样本</span><span class="v">0</span></div>'; return; }
-    const models = (g.models||[]).map(m =>
-      `<div class="obs-row"><span class="k obs-model">${m.model || '—'}</span><span class="v">${m.count} 次</span></div>`).join('');
-    el.innerHTML =
-      `<div class="obs-row"><span class="k">样本数</span><span class="v">${g.n}</span></div>` + models +
-      `<div class="obs-row"><span class="k">平均首包</span><span class="v">${g.avg_ttft_ms ? (g.avg_ttft_ms/1000).toFixed(1) + 's' : '—'}</span></div>
-       <div class="obs-row"><span class="k">平均输出 tokens</span><span class="v">${g.avg_out_tokens || '—'}</span></div>
-       <div class="obs-row"><span class="k">平均推理 tokens</span><span class="v">${g.avg_reason_tokens || '—'}</span></div>`;
-  };
-  if(s.observations){
-    renderObs($('obs-on'), s.observations.on);
-    renderObs($('obs-off'), s.observations.off);
-    if(s.observations.note) $('obs-note').textContent = s.observations.note;
-  }
-
-  const log = $('log');
-  log.innerHTML = (s.log_tail||[]).slice(-120).map(l=>{
-    let cls = '';
-    if(l.includes('[warn')) cls='w'; else if(l.includes('[error')) cls='e';
-    else if(l.includes('accepted') || l.includes('request_finished')) cls='g';
-    const sp = l.indexOf(' ');
-    return `<div><span class="t">${l.slice(0,sp)}</span><span class="${cls}">${l.slice(sp+1)}</span></div>`;
-  }).join('');
-  log.scrollTop = log.scrollHeight;
-}
-
-async function act(body){
-  const r = await fetch('/panel/api/action' + (KEY ? '?key=' + encodeURIComponent(KEY) : ''),
-    {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)});
-  const j = await r.json().catch(()=>({}));
-  if(!j.ok && j.error) alert(j.error);
-}
-$('btn-probe').onclick = () => act({action:'probe_now'});
-$('btn-check').onclick = () => { if(confirm('对每个出口发 1 次知识探针（消耗额度）？')) act({action:'egress_check'}); };
-$('btn-toggle').onclick = () => act({action:'toggle_injection'});
-$('btn-clear').onclick = () => { if(confirm('清除已采集的 state？')) act({action:'clear_state'}); };
-$('btn-restore').onclick = () => { if(confirm('恢复 Codex 配置（移除本地网关接管）？')) act({action:'restore_config'}); };
-$('sel-fallback').onchange = e => act({action:'set_fallback', mode:e.target.value});
-$('sel-plan').onchange = e => act({action:'set_account_mode', mode:e.target.value});
-
-poll();
-</script>
-</body>
-</html>
-"""
 
 
 # ---------------------------------------------------------------- 图标与托盘 --
@@ -2150,6 +1830,15 @@ def test_egress_egress(e: Egress) -> str:
         return f"fail: {e.last_error}"
 
 
+def _say(msg):
+    """安装器输出：控制台 + 日志双通道（noconsole 下仍落文件）。"""
+    try:
+        print(msg)
+    except Exception:
+        pass
+    log("install", detail=str(msg)[:200])
+
+
 def cmd_install() -> int:
     _say("=" * 56)
     _say(" ccodex-sleep-plus 安装")
@@ -2324,6 +2013,26 @@ def selftest():
         ('data: {"type":"response.output_text.delta","delta":"iPhone "}' + chr(10) + chr(10)
          + 'data: {"type":"response.output_text.delta","delta":"17 Pro"}' + chr(10) + chr(10)).encode())
     check("sse answer delta concat", a1 == "iPhone 17 Pro")
+
+    # 托盘/图标栈可用性（exe 打包缺 PIL C 扩展时在此暴露）
+    try:
+        from PIL import Image, ImageChops, ImageDraw  # noqa: F401
+        check("PIL importable (tray icon)", True)
+    except Exception as e:
+        check(f"PIL importable ({e})", False)
+    try:
+        import pystray  # noqa: F401
+        check("pystray importable (tray)", True)
+    except Exception as e:
+        check(f"pystray importable ({e})", False)
+    try:
+        img = build_icon_image()
+        check("icon builds", img.size == (64, 64))
+    except Exception as e:
+        check(f"icon builds ({e})", False)
+
+    html = _panel_html()
+    check("panel.html present", "重新体检" in html and "btn-check" in html)
 
     print("selftest", "OK" if ok else "FAILED")
     return ok
@@ -2523,5 +2232,29 @@ def main():
         log("gateway_stopped", detail="配置已恢复，请重启 Codex")
 
 
+def _crash_dialog(exc: BaseException):
+    """noconsole exe 崩溃时写日志并弹窗，绝不静默消失。"""
+    import traceback
+    msg = "".join(traceback.format_exception(exc)).strip()
+    try:
+        (data_dir() / "crash.log").write_text(
+            time.strftime("%Y-%m-%d %H:%M:%S") + chr(10) + msg, encoding="utf8")
+    except Exception:
+        pass
+    try:
+        import ctypes
+        ctypes.windll.user32.MessageBoxW(
+            0, "ccodex-sleep-plus 发生错误，详情见 crash.log：" + chr(10) + chr(10)
+            + msg[-500:], APP, 0x10)
+    except Exception:
+        pass
+
+
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except SystemExit:
+        raise
+    except BaseException as _exc:
+        _crash_dialog(_exc)
+        sys.exit(1)

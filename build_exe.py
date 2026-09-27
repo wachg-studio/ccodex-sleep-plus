@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Build ccodex-sleep-plus.exe with PyInstaller."""
+"""Build ccodex-sleep-plus with PyInstaller (onedir mode, stable for C extensions)."""
 import PyInstaller.__main__
 import sleep_plus as sp
 
@@ -8,12 +8,14 @@ print("icon:", ico)
 
 PyInstaller.__main__.run([
     "sleep_plus.py",
-    "--onefile", "--noconsole",
+    "--onedir", "--noconsole",
     "--name", "ccodex-sleep-plus",
     "--icon", str(ico),
+    "--add-data", f"{sp.Path(__file__).parent / 'panel.html'};.",
     "--hidden-import", "pystray._win32",
+    "--collect-all", "PIL",
+    "--collect-all", "pystray",
     "--hidden-import", "webview.platforms.edgechromium",
-    "--hidden-import", "webview.platforms.winforms",
     "--hidden-import", "clr_loader",
     "--collect-submodules", "compression",
     "--exclude-module", "tkinter",

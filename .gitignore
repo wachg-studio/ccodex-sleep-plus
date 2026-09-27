@@ -2,8 +2,8 @@ __pycache__/
 *.pyc
 build/
 dist/
+setup/
 *.spec
-build.log
+*.log
 _*.py
 _*.cmd
-ccodex.ico

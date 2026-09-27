@@ -227,9 +227,39 @@ def run_config_test():
     check("restore idempotent", r5.get("ok"))
 
 
+# ---- 安装器 dry-run（副作用全 stub，捕获 NameError/逻辑回归） ----
+def run_installer_dryrun_test():
+    import types
+    import subprocess
+    tmp = Path(os.environ["TEMP"]) / "sleep-plus-test-codex"
+    tmp.mkdir(exist_ok=True)
+    (tmp / "config.toml").write_text('model = "gpt-6-astra"\n', encoding="utf8")
+    (tmp / "auth.json").write_text("{}", encoding="utf8")
+    os.environ["CODEX_HOME"] = str(tmp)
+
+    import sleep_plus as sp
+    calls = []
+    sp.test_egress_egress = lambda e: (calls.append("egress_test"), "ok")[1]
+    sp.install_shortcuts = lambda *a, **k: calls.append("shortcuts")
+    sp.gateway_alive = lambda *a: False
+    sp.spawn_panel = lambda: calls.append("panel")
+    real_popen = subprocess.Popen
+    sp.subprocess.Popen = lambda *a, **k: (calls.append("popen"), object())[1]
+    sp.time.sleep = lambda s: None
+    try:
+        rc = sp.cmd_install()
+        check("cmd_install dry-run completes", rc in (0, 1))
+        check("cmd_install ran stages", "egress_test" in calls and "shortcuts" in calls)
+    except Exception as e:
+        check("cmd_install dry-run (failed: %s %s)" % (e.__class__.__name__, e), False)
+    finally:
+        sp.subprocess.Popen = real_popen
+
+
 if __name__ == "__main__":
     run_gateway_test()
     run_config_test()
+    run_installer_dryrun_test()
     failed = [n for n, ok in results if not ok]
     print(f"\n{len(results) - len(failed)}/{len(results)} passed")
     sys.exit(1 if failed else 0)
