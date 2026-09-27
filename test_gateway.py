@@ -55,7 +55,8 @@ class MockUpstream(BaseHTTPRequestHandler):
             body = _gz.decompress(body)
         seen["model"] = json.loads(body).get("model")
         seen["raw_body"] = body.decode("utf8", "replace")
-        if self.path.endswith("/responses"):
+        seen["path_with_query"] = self.path
+        if self.path.split("?")[0].endswith("/responses"):
             payload = (b"event: response.output_text.delta\n"
                        + ('data: {"type":"response.output_text.delta","delta":"'
                           + MOCK_ANSWER + '"}').encode() + b"\n\n"
@@ -143,6 +144,15 @@ def run_gateway_test():
     check("gzip request forwarded as-is (fidelity)",
           r.status == 200 and seen.get("model") == "gpt-6-astra"
           and seen.get("req_content_encoding") == "gzip")
+
+    # 2a) query 透传（上游要求 ?client_version=...）
+    c.request("POST", sp.UPSTREAM_BASE + "/responses?client_version=0.153.4",
+              body=json.dumps({"model": "gpt-6-astra", "input": []}).encode(),
+              headers={"Authorization": "Bearer test-token-1234567890",
+                       "chatgpt-account-id": "acc-1", "Content-Type": "application/json"})
+    r = c.getresponse(); r.read()
+    check("query string forwarded", r.status == 200
+          and seen.get("path_with_query", "").endswith("client_version=0.153.4"))
 
     # 2b) 时区归一化改写
     engine.settings["tz_mode"] = "fixed"

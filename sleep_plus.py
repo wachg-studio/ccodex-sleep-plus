@@ -1677,8 +1677,16 @@ class Gateway(BaseHTTPRequestHandler):
                                 combined=e.quality, answer=e.quality_answer)
                             if not r.get("ok") and r.get("status") in (401, 403, 429):
                                 return
+                            # 单次满血即刻入池（与 refresh 的 healthy-now 优先一致）
+                            if r.get("ok") and r.get("shape_ok") and r.get("quality") == "healthy":
+                                sess.store.offer(r["state"])
+                                sess.state_egress = e.id
+                                sess.state_healthy = True
+                                sess.degraded_rounds = 0
                         if e.quality in ("degraded", "severely"):
-                            if sess.state_egress == e.id:
+                            bound_or_empty = (sess.state_egress == e.id
+                                              or sess.store.active is None)
+                            if bound_or_empty:
                                 sess.store.clear()
                                 sess.state_healthy = False
                                 sess.next_probe = min(sess.next_probe, time.time() + DEGRADED_RETRY)
@@ -1890,7 +1898,9 @@ class Gateway(BaseHTTPRequestHandler):
         started = time.time()
         try:
             conn = egress.https_connection(UPSTREAM_HOST, 600)
-            upath = urllib.parse.urlparse(self.path).path
+            # 完整透传 path + query：上游要求 ?client_version=… 等 query 参数，
+            # 只转发 path 会把它们丢掉并被上游以 400 拒绝
+            upath = self.path
             if self.command == "GET":
                 conn.request("GET", upath, headers=out_headers)
             else:

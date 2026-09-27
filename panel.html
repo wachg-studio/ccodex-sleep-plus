@@ -267,12 +267,20 @@ function render(s){
       `建议<b>保持当前节点稳定</b>，不必频繁切换或反复体检。`);
   } else if (degraded.length){
     const d = degraded[0];
-    setHero(d.quality === 'severely' ? 'bad' : 'warn',
-      d.quality === 'severely' ? '当前节点：严重降智（正在自愈）' : '当前节点：疑似降智（正在自愈）',
-      `体检回答为 <b>${d.quality_answer || 'iPhone 16'}</b>（降智档）。` +
-      `工具已<b>自动丢弃被污染的 state</b>，几分钟后会在<b>同一节点自动重试</b>——` +
-      `降智窗口通常是分钟级的，常会自行恢复。<b>无需手动换节点、也不建议频繁换 IP</b>；` +
-      `若较长时间仍未恢复，再考虑换一次节点。`);
+    const lastHealthy = (d.quality_history||[]).length
+      && d.quality_history[d.quality_history.length-1].q === 'healthy';
+    if (lastHealthy){
+      setHero('warn', '正在恢复中…',
+        `最近一次探针已答出 <b>iPhone 17</b>（满血），旧判定票还在窗口内，` +
+        `综合结论马上翻转；满血 state 已重新采入。稍等片刻即可，无需任何操作。`);
+    } else {
+      setHero(d.quality === 'severely' ? 'bad' : 'warn',
+        d.quality === 'severely' ? '当前节点：严重降智（正在自愈）' : '当前节点：疑似降智（正在自愈）',
+        `体检回答为 <b>${(d.quality_answer || 'iPhone 16').replace('单次降智·', '')}</b>（降智档）。` +
+        `工具已隔离该链路的 state，几分钟后会在<b>同一节点自动重试</b>——` +
+        `降智窗口通常是分钟级的，常会自行恢复。<b>无需手动换节点、也不建议频繁换 IP</b>；` +
+        `若较长时间仍未恢复，再考虑换一次节点。`);
+    }
   } else {
     setHero('idle', '还没有体检数据',
       `点右上角「<b>重新体检</b>」测一次（每个出口 1 条极短消息，消耗少量额度），` +
