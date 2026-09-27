@@ -173,6 +173,12 @@
       <div class="actions">
         <button id="btn-toggle"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18.36 6.64a9 9 0 1 1-12.73 0"/><line x1="12" y1="2" x2="12" y2="11"/></svg><span id="btn-toggle-t">关闭注入</span></button>
         <button id="btn-probe"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-2.64-6.36"/><polyline points="21 3 21 9 15 9"/></svg>只采 state</button>
+        <select id="sel-keepalive" title="自动保活：定期探针维持满血 state">
+          <option value="off">自动保活：关</option>
+          <option value="600">自动保活：每 10 分钟</option>
+          <option value="300">自动保活：每 5 分钟（更耗额度）</option>
+          <option value="1800">自动保活：每 30 分钟（省额度）</option>
+        </select>
         <select id="sel-fallback" title="没有合格 state 时的行为">
           <option value="passthrough">无 state 时：正常转发（推荐）</option>
           <option value="strict">无 state 时：暂停并提示</option>
@@ -247,19 +253,20 @@ function render(s){
 
   if (best.length){
     setHero('ok', '当前节点：未发现降智',
-      `体检回答为 <b>iPhone 17</b>（满血档）。防护${protecting ? '开启中' : '已关闭'}。` +
+      `体检回答为 <b>iPhone 17</b>（满血档）。防护${protecting ? '开启中，自动保活满血 state' : '已关闭'}。` +
       `建议<b>保持当前节点稳定</b>，不必频繁切换或反复体检。`);
   } else if (degraded.length){
     const d = degraded[0];
     setHero(d.quality === 'severely' ? 'bad' : 'warn',
-      d.quality === 'severely' ? '当前节点：严重降智' : '当前节点：疑似降智',
+      d.quality === 'severely' ? '当前节点：严重降智（正在自愈）' : '当前节点：疑似降智（正在自愈）',
       `体检回答为 <b>${d.quality_answer || 'iPhone 16'}</b>（降智档）。` +
-      `可以<b>换一个节点后点一次「重新体检」</b>验证；但<b>不要频繁换 IP</b>——` +
-      `频繁变动出口可能增加风控风险，找到满血节点后请保持稳定。`);
+      `工具已<b>自动丢弃被污染的 state</b>，几分钟后会在<b>同一节点自动重试</b>——` +
+      `降智窗口通常是分钟级的，常会自行恢复。<b>无需手动换节点、也不建议频繁换 IP</b>；` +
+      `若较长时间仍未恢复，再考虑换一次节点。`);
   } else {
     setHero('idle', '还没有体检数据',
       `点右上角「<b>重新体检</b>」测一次（每个出口 1 条极短消息，消耗少量额度），` +
-      `即可知道当前节点是否被降智。`);
+      `即可知道当前节点是否被降智。平时无需手动操作，工具会自动保活。`);
   }
   $('s-protect').textContent = protecting ? (sess && sess.state.usable ? '防护中' : '待命中') : '已关闭';
 
@@ -288,13 +295,20 @@ function render(s){
   }
   if (sess){
     rows.push(['模型', sess.model], ['上次采集', sess.last_probe_result || '—'],
+      ['state 健康', sess.state_healthy === false ? '降智污染（已隔离）' : '满血/未知'],
       ['账号规则', sess.plan === 'team' ? 'Team' : '个人' + (s.account_mode==='auto' ? '（自动）' : '（手动）')]);
+  }
+  if (s.keepalive){
+    rows.push(['今日探针', `${s.keepalive.probes_today} / ${s.keepalive.daily_limit} 次`]);
   }
   $('state-info').innerHTML = rows.map(([k,v]) =>
     `<div class="row"><span class="k">${k}</span><span class="v">${v}</span></div>`).join('');
 
   $('btn-toggle-t').textContent = s.injection_enabled ? '关闭注入' : '开启注入';
   $('sel-fallback').value = s.fallback; $('sel-plan').value = s.account_mode;
+  if (s.keepalive){
+    $('sel-keepalive').value = s.keepalive.enabled ? String(s.keepalive.interval) : 'off';
+  }
 
   const renderObs = (el, g) => {
     if(!g || !g.n){ el.innerHTML = '<div class="obs-row"><span class="k">暂无样本</span><span class="v"></span></div>'; return; }
@@ -333,6 +347,11 @@ $('btn-toggle').onclick = () => act({action:'toggle_injection'});
 $('btn-restore').onclick = () => { if(confirm('恢复 Codex 原始配置？（工具将不再接管 Codex）')) act({action:'restore_config'}); };
 $('sel-fallback').onchange = e => act({action:'set_fallback', mode:e.target.value});
 $('sel-plan').onchange = e => act({action:'set_account_mode', mode:e.target.value});
+$('sel-keepalive').onchange = e => {
+  const v = e.target.value;
+  if (v === 'off') act({action:'set_keepalive', enabled:false});
+  else act({action:'set_keepalive', enabled:true, interval:parseInt(v,10)});
+};
 
 poll();
 </script>

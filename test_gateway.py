@@ -31,6 +31,7 @@ def make_state(blocks=10, age=30):
 
 
 MOCK_STATE = make_state(10)
+MOCK_ANSWER = "iPhone 17 Pro"
 seen = {}
 
 
@@ -41,14 +42,18 @@ class MockUpstream(BaseHTTPRequestHandler):
         pass
 
     def do_POST(self):
+        global MOCK_ANSWER
         n = int(self.headers.get("Content-Length") or 0)
         body = self.rfile.read(n)
         seen["state_header"] = self.headers.get(sp.STATE_HEADER)
         seen["auth"] = self.headers.get("Authorization")
         seen["model"] = json.loads(body).get("model")
         if self.path.endswith("/responses"):
-            payload = (b"event: response.completed\n"
-                       b'data: {"type":"response.completed"}\n\n')
+            payload = (b"event: response.output_text.delta\n"
+                       + ('data: {"type":"response.output_text.delta","delta":"'
+                          + MOCK_ANSWER + '"}').encode() + b"\n\n"
+                       + b"event: response.completed\n"
+                       + b'data: {"type":"response.completed"}\n\n')
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
             self.send_header(sp.STATE_HEADER, MOCK_STATE)
@@ -256,10 +261,39 @@ def run_installer_dryrun_test():
         sp.subprocess.Popen = real_popen
 
 
+# ---- 降智隔离与自愈测试 ----
+def run_healing_test():
+    global MOCK_ANSWER, MOCK_STATE
+    upstream = ThreadingHTTPServer(("127.0.0.1", MOCK_PORT), MockUpstream)
+    upstream.daemon_threads = True
+    threading.Thread(target=upstream.serve_forever, daemon=True).start()
+    sp.UPSTREAM_HOST = "127.0.0.1"
+    engine = sp.Engine({"injection_enabled": True, "fallback": "passthrough",
+                        "account_mode": "auto", "model": "gpt-6-astra"}, sp.Persist())
+    engine.egresses = [HTTPEgress("mock", "mock-upstream", "direct", "127.0.0.1", MOCK_PORT)]
+    sess, _ = engine.borrow({"Authorization": "Bearer heal-token-123456",
+                             "chatgpt-account-id": "h1"}, "gpt-6-astra")
+
+    MOCK_STATE = make_state(10)
+    MOCK_ANSWER = "iPhone 17 Pro"
+    engine.refresh(sess, manual=True)
+    check("healthy probe fills pool", sess.store.acquire(time.time()) is not None)
+    check("state marked healthy", sess.state_healthy is True)
+
+    MOCK_ANSWER = "iPhone 16e"
+    engine.refresh(sess, manual=True)
+    check("degraded probe clears pool", sess.store.acquire(time.time()) is None)
+    check("state marked unhealthy", sess.state_healthy is False)
+    check("degraded retry short (self-heal)", sess.next_probe - time.time() <= sp.DEGRADED_RETRY + 5)
+    check("keepalive defaults", engine.settings.get("keepalive_interval", sp.KEEPALIVE_DEFAULT) >= 240)
+    upstream.shutdown()
+
+
 if __name__ == "__main__":
     run_gateway_test()
     run_config_test()
     run_installer_dryrun_test()
+    run_healing_test()
     failed = [n for n, ok in results if not ok]
     print(f"\n{len(results) - len(failed)}/{len(results)} passed")
     sys.exit(1 if failed else 0)

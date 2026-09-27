@@ -632,6 +632,13 @@ class Session:
         self.state_egress = "direct"
         self.last_active = time.time()
         self.fail_rounds = 0           # 连续未采到合格 state 的轮数（指数退避）
+        self.state_healthy = True      # 当前 state 是否采集自满血出口
+        self.next_keepalive = 0.0      # 保活下一次触发时间
+
+
+KEEPALIVE_DEFAULT = 600       # 保活间隔（秒）
+PROBE_DAILY_LIMIT = 200       # 每日探针请求上限（防失控烧额度）
+DEGRADED_RETRY = 300          # 出口降智后的自愈重试间隔（上游裁决窗口为分钟级）
 
 
 class Engine:
@@ -643,6 +650,8 @@ class Engine:
         self.lock = threading.Lock()
         self.requests_total = 0
         self.probes_total = 0
+        self.probe_date = time.strftime("%Y%m%d")
+        self.probes_today = 0
         self.started_at = time.time()
         self.stop = threading.Event()
         self.observations = collections.deque(maxlen=300)
@@ -876,22 +885,41 @@ class Engine:
                 idx = sess.egress_cursor % len(self.egresses)
                 sess.egress_cursor += 1
                 egress = self.egresses[idx]
+                if self._probe_budget_exceeded():
+                    log("probe_skipped", level="warn", detail="已达每日探针上限，防额度失控")
+                    return
                 self.probes_total += 1
+                self.probes_today += 1
                 attempts += 1
                 r = self.probe_once(sess, egress)
                 if r.get("ok"):
                     egress.last_ok = time.time()
                     egress.uses += 1
                     egress.last_error = ""
-                    if r["shape_ok"]:
+                    if r["shape_ok"] and r.get("quality") in ("healthy", "unknown"):
+                        # 满血（或无法判定）才入库；unknown 保守按可用
                         sess.store.offer(r["state"])
                         sess.state_egress = egress.id
-                        sess.last_probe_result = "accepted"
+                        sess.state_healthy = r.get("quality") == "healthy"
+                        sess.last_probe_result = "accepted" + (
+                            "" if sess.state_healthy else "(质量未知)")
                         sess.observed_blocks = r["blocks"]
                         accepted = True
                         log("probe_finished", egress=egress.id, result="accepted",
+                            quality=r.get("quality"),
                             blocks=r["blocks"], expected=sorted(self.blocks_for(sess)))
                         self.save()
+                        return
+                    if r["shape_ok"] and r.get("quality") in ("degraded", "severely"):
+                        # 出口降智：丢弃可能被污染的 state（注入会延续降智链路），
+                        # 短退避后同出口自愈重试（上游裁决窗口为分钟级）
+                        sess.store.clear()
+                        sess.state_healthy = False
+                        sess.last_probe_result = "quality_" + r["quality"]
+                        log("probe_finished", egress=egress.id,
+                            result="degraded_state_discarded",
+                            quality=r.get("quality"), answer=egress.quality_answer,
+                            detail="已清空 state 池，将在冷却后同出口自愈重试")
                         return
                     sess.observed_blocks = r["blocks"]
                     sess.last_probe_result = "shape_mismatch"
@@ -915,11 +943,22 @@ class Engine:
                 if accepted:
                     sess.fail_rounds = 0
                     sess.next_probe = time.time() + COOLDOWN_SECONDS
+                elif not sess.state_healthy and sess.store.active is None:
+                    # 降智自愈：短退避等上游裁决窗口滑动，不用指数退避
+                    sess.fail_rounds = 0
+                    sess.next_probe = time.time() + DEGRADED_RETRY
                 else:
                     # 连续采不到合格 state 时指数退避，避免烧额度：3min→10min→30min→60min 封顶
                     delay = min(COOLDOWN_SECONDS * (2 ** min(sess.fail_rounds, 4)), 3600)
                     sess.fail_rounds += 1
                     sess.next_probe = time.time() + delay
+
+    def _probe_budget_exceeded(self) -> bool:
+        today = time.strftime("%Y%m%d")
+        if self.probe_date != today:
+            self.probe_date = today
+            self.probes_today = 0
+        return self.probes_today >= PROBE_DAILY_LIMIT
 
     def bootstrap_from_auth(self):
         """增强点：直接从 auth.json 建立会话并采集，无需先在 Codex 发消息。"""
@@ -964,21 +1003,28 @@ class Engine:
         return None
 
     def refresher_loop(self):
+        """保活循环：临期刷新 + 定期保活（维持满血 state 链路）+ 降智自愈重试。"""
         while not self.stop.wait(10):
             try:
                 if not self.settings.get("injection_enabled", True):
                     continue
                 now = time.time()
+                keepalive_on = self.settings.get("keepalive_enabled", True)
+                keepalive_iv = int(self.settings.get("keepalive_interval") or KEEPALIVE_DEFAULT)
                 for sess in list(self.sessions.values()):
                     if now - sess.last_active > 1800:
                         continue
-                    st = sess.store
-                    if (not st.needs_refresh(now) or now < sess.next_probe
-                            or sess.probing or self.limited(sess)[0]):
+                    if now < sess.next_probe or sess.probing or self.limited(sess)[0]:
                         continue
                     if not sess.headers.get("Authorization"):
                         continue
+                    need = sess.store.needs_refresh(now) or not sess.state_healthy
+                    if keepalive_on and now >= sess.next_keepalive:
+                        need = True
+                    if not need:
+                        continue
                     self.refresh(sess)
+                    sess.next_keepalive = now + keepalive_iv
             except Exception as e:
                 log("refresher_error", level="error", err=str(e))
 
@@ -994,6 +1040,7 @@ class Engine:
                      else "collecting" if sess.probing else "waiting")
             sessions.append({
                 "key": key[:8], "model": sess.model,
+                "state_healthy": sess.state_healthy,
                 "plan": self.account_mode_effective(sess),
                 "token_plan": sess.plan,
                 "phase": phase, "state": sess.store.snapshot(),
@@ -1019,6 +1066,12 @@ class Engine:
             "log_tail": list(_LOG)[-140:],
             "ttl": TTL_SECONDS,
             "observations": self.observations_summary(),
+            "keepalive": {
+                "enabled": bool(self.settings.get("keepalive_enabled", True)),
+                "interval": int(self.settings.get("keepalive_interval") or KEEPALIVE_DEFAULT),
+                "probes_today": self.probes_today,
+                "daily_limit": PROBE_DAILY_LIMIT,
+            },
         }
 
 
@@ -1369,6 +1422,18 @@ class Gateway(BaseHTTPRequestHandler):
                 eng.save()
             threading.Thread(target=_check_all, daemon=True).start()
             self._json({"ok": True})
+        elif action == "set_keepalive":
+            eng.settings["keepalive_enabled"] = bool(req.get("enabled", True))
+            if req.get("interval"):
+                try:
+                    eng.settings["keepalive_interval"] = max(240, min(3600, int(req["interval"])))
+                except (TypeError, ValueError):
+                    self._fail(400, "invalid_interval", "interval 需为 240-3600 的秒数")
+                    return
+            eng.persist.write(_merge_persist(eng))
+            log("keepalive_updated", enabled=eng.settings["keepalive_enabled"],
+                interval=eng.settings.get("keepalive_interval"))
+            self._json({"ok": True})
         elif action == "restore_config":
             r = restore_provider()
             self._json(r)
@@ -1555,7 +1620,8 @@ def _merge_persist(engine: Engine):
     data = engine.persist.read()
     settings = engine.settings
     data["settings"] = {k: settings.get(k) for k in
-                        ("injection_enabled", "fallback", "account_mode", "model")}
+                        ("injection_enabled", "fallback", "account_mode", "model",
+                         "keepalive_enabled", "keepalive_interval")}
     data["panel_key"] = PANEL_KEY
     data["port"] = LISTEN_PORT
     return data
@@ -2119,6 +2185,8 @@ def main():
     settings.setdefault("fallback", "passthrough")
     settings.setdefault("account_mode", "auto")
     settings.setdefault("model", DEFAULT_MODEL)
+    settings.setdefault("keepalive_enabled", True)
+    settings.setdefault("keepalive_interval", KEEPALIVE_DEFAULT)
     # 面板密钥：优先沿用已保存值；否则按本机派生（跨重启稳定，面板链接不会过期）
     PANEL_KEY = saved.get("panel_key") or hashlib.sha256(
         f"ccodex-sleep-plus:{Path.home()}".encode()).hexdigest()[:16]
