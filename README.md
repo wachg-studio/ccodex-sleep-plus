@@ -4,7 +4,7 @@ Codex 降智检测与自愈的本地常驻工具：出口质量体检、满血 s
 
 ## 下载安装（Windows）
 
-**→ [下载安装包 ccodex-sleep-plus-setup.exe](https://github.com/wachg-studio/ccodex-sleep-plus/releases/download/v1.0.0/ccodex-sleep-plus-setup.exe)**　（约 47 MB，[全部版本](https://github.com/wachg-studio/ccodex-sleep-plus/releases)）
+**→ [下载安装包 ccodex-sleep-plus-setup.exe](https://github.com/wachg-studio/ccodex-sleep-plus/releases/download/v1.1.0/ccodex-sleep-plus-setup.exe)**　（约 47 MB，[全部版本](https://github.com/wachg-studio/ccodex-sleep-plus/releases)）
 
 三步上手：
 
