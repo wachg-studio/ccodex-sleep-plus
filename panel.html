@@ -157,7 +157,7 @@
   </section>
 
   <div class="card fade">
-    <h3><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M3 12h18"/><path d="M12 3a15 15 0 0 1 0 18 15 15 0 0 1 0-18z"/></svg>网络出口（换节点后点「重新体检」对比结果）</h3>
+    <h3><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M3 12h18"/><path d="M12 3a15 15 0 0 1 0 18 15 15 0 0 1 0-18z"/></svg>网络出口（体检结论以最近一次为准）</h3>
     <div id="egresses"></div>
   </div>
 
@@ -248,13 +248,14 @@ function render(s){
   if (best.length){
     setHero('ok', '当前节点：未发现降智',
       `体检回答为 <b>iPhone 17</b>（满血档）。防护${protecting ? '开启中' : '已关闭'}。` +
-      `可正常使用；感觉异常时随时点「重新体检」。`);
+      `建议<b>保持当前节点稳定</b>，不必频繁切换或反复体检。`);
   } else if (degraded.length){
     const d = degraded[0];
     setHero(d.quality === 'severely' ? 'bad' : 'warn',
       d.quality === 'severely' ? '当前节点：严重降智' : '当前节点：疑似降智',
       `体检回答为 <b>${d.quality_answer || 'iPhone 16'}</b>（降智档）。` +
-      `建议：<b>在代理软件里切换一个节点，然后点「重新体检」</b>，直到显示满血。`);
+      `可以<b>换一个节点后点一次「重新体检」</b>验证；但<b>不要频繁换 IP</b>——` +
+      `频繁变动出口可能增加风控风险，找到满血节点后请保持稳定。`);
   } else {
     setHero('idle', '还没有体检数据',
       `点右上角「<b>重新体检</b>」测一次（每个出口 1 条极短消息，消耗少量额度），` +
