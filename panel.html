@@ -159,7 +159,7 @@
   </section>
 
   <div class="card fade">
-    <h3><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M3 12h18"/><path d="M12 3a15 15 0 0 1 0 18 15 15 0 0 1 0-18z"/></svg>网络出口（体检结论以最近一次为准）</h3>
+    <h3><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M3 12h18"/><path d="M12 3a15 15 0 0 1 0 18 15 15 0 0 1 0-18z"/></svg>网络出口（徽标=近3次多数表决；state 与出口绑定，其他出口降智不影响当前链路）</h3>
     <div id="egresses"></div>
   </div>
 
@@ -355,6 +355,9 @@ function render(s){
     const a = attrEg.attribution;
     rows.push(['深度归因', `<span class="mono">${a.prediction} ${(a.probability*100).toFixed(0)}%</span>（${attrEg.label}）`]);
   }
+  if (s.heal){
+    rows.push(['自愈记录', `检出 ${s.heal.detected} 次 · 恢复 ${s.heal.recovered} 次`]);
+  }
   if (s.timezone){
     rows.push(['请求时区', s.timezone.last_seen
       ? `${s.timezone.last_seen}${s.timezone.mode === 'fixed' ? ' → ' + s.timezone.value : ''}（改写 ${s.timezone.overrides} 次）`
@@ -367,6 +370,9 @@ function render(s){
   $('sel-fallback').value = s.fallback; $('sel-plan').value = s.account_mode;
   if (s.keepalive){
     $('sel-keepalive').value = s.keepalive.enabled ? String(s.keepalive.interval) : 'off';
+  }
+  if (s.heal){
+    rows.push(['自愈记录', `检出 ${s.heal.detected} 次 · 恢复 ${s.heal.recovered} 次`]);
   }
   if (s.timezone){
     $('sel-tz').value = s.timezone.mode === 'fixed' ? s.timezone.value : 'off';

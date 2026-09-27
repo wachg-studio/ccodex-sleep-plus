@@ -47,6 +47,12 @@ class MockUpstream(BaseHTTPRequestHandler):
         body = self.rfile.read(n)
         seen["state_header"] = self.headers.get(sp.STATE_HEADER)
         seen["auth"] = self.headers.get("Authorization")
+        # 模拟真实上游：按 Content-Encoding 解压请求体
+        enc = (self.headers.get("Content-Encoding") or "").lower()
+        seen["req_content_encoding"] = enc or None
+        if enc == "gzip":
+            import gzip as _gz
+            body = _gz.decompress(body)
         seen["model"] = json.loads(body).get("model")
         seen["raw_body"] = body.decode("utf8", "replace")
         if self.path.endswith("/responses"):
@@ -134,7 +140,9 @@ def run_gateway_test():
                        "Content-Encoding": "gzip"})
     r = c.getresponse()
     r.read()
-    check("gzip request decoded", r.status == 200 and seen.get("model") == "gpt-6-astra")
+    check("gzip request forwarded as-is (fidelity)",
+          r.status == 200 and seen.get("model") == "gpt-6-astra"
+          and seen.get("req_content_encoding") == "gzip")
 
     # 2b) 时区归一化改写
     engine.settings["tz_mode"] = "fixed"
@@ -310,6 +318,17 @@ def run_healing_test():
     engine.egresses[0].record_quality("healthy", src="attribution")
     check("attribution verdict overrides", engine.egresses[0].quality == "healthy"
           and len(engine.egresses[0].quality_history) == 1)
+
+    # 自愈升级：同出口连续两轮综合降智后，下一轮自动换出口
+    engine.egresses.append(HTTPEgress("mock2", "mock-upstream-2", "direct", "127.0.0.1", MOCK_PORT))
+    sess.degraded_rounds = 2
+    engine.refresh(sess, manual=True)   # 第 3 次降智 → 升级换出口
+    check("escalation rotates egress after 2 degraded rounds",
+          sess.degraded_rounds >= 3 and len(engine.egresses) > 1)
+
+    # 自愈统计
+    h = engine.heal_summary()
+    check("heal stats present", h["detected"] >= 1 and "recovered" in h)
     upstream.shutdown()
 
 
@@ -331,16 +350,26 @@ def run_attribution_test():
     MOCK_STATE = make_state(10)
     MOCK_ANSWER = fixtures["gpt-6-astra"]["text"]
     sess.store.offer(sp.parse_state(MOCK_STATE))
+    sess.state_egress = "mock"                     # state 绑定归因出口
     r = engine.deep_attribution(sess, engine.egresses[0])
     check("attribution match", r.get("ok") and r.get("prediction") == "gpt-6-astra")
     check("attribution sets healthy", engine.egresses[0].quality == "healthy")
 
-    # 归因失配：mock 返回 luna 指纹 → mismatch，state 池清空进入自愈
+    # 归因失配（绑定出口）：mock 返回 luna 指纹 → 清池进入自愈
     MOCK_ANSWER = fixtures["gpt-5.6-luna"]["text"]
     r2 = engine.deep_attribution(sess, engine.egresses[0])
     check("attribution mismatch detected", r2.get("ok") and r2.get("prediction") == "gpt-5.6-luna")
-    check("mismatch clears state pool", sess.store.acquire(time.time()) is None)
+    check("mismatch clears bound pool", sess.store.acquire(time.time()) is None)
     check("mismatch marks unhealthy", sess.state_healthy is False)
+
+    # 归因失配（非绑定出口）：不动绑定出口的 state —— 修复"一秒又变"的关键行为
+    other = HTTPEgress("mock-other", "mock-other", "direct", "127.0.0.1", MOCK_PORT)
+    engine.egresses.append(other)
+    sess.store.offer(sp.parse_state(make_state(10)))
+    sess.state_egress = "mock"                     # state 绑定 mock，归因跑在 other
+    r3 = engine.deep_attribution(sess, other)
+    check("unbound mismatch keeps state", r3.get("ok")
+          and sess.store.acquire(time.time()) is not None)
     upstream.shutdown()
 
 

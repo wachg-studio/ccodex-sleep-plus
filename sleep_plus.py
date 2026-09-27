@@ -295,9 +295,11 @@ class Egress:
         """滚动窗口多数表决：最近 3 次中 2 票一致才定性；单次 unknown 不投票。
         深度归因 (src=attribution) 为终审，直接覆盖历史。返回综合判定。"""
         now = int(time.time())
+        prev = self.quality
         if src == "attribution":
             self.quality_history = [{"q": single, "at": now, "src": "attribution"}]
             self.quality = single
+            self._emit_heal_event(prev)
             return self.quality
         if single and single != "unknown":
             self.quality_history.append({"q": single, "at": now, "src": src})
@@ -307,7 +309,20 @@ class Egress:
             counts = {v: votes.count(v) for v in set(votes)}
             best, n = max(counts.items(), key=lambda kv: kv[1])
             self.quality = best if (n >= 2 or len(votes) == 1 and len(self.quality_history) == 1) else "unknown"
+        self._emit_heal_event(prev)
         return self.quality
+
+    def _emit_heal_event(self, prev: str):
+        """记录降智检出 / 恢复事件（供面板统计自愈效果）。"""
+        now = int(time.time())
+        bad = ("degraded", "severely")
+        if prev not in bad and self.quality in bad:
+            self.quality_events = getattr(self, "quality_events", collections.deque(maxlen=50))
+            self.quality_events.append({"at": now, "kind": "detected"})
+        elif prev in bad and self.quality not in bad and self.quality != "unknown":
+            self.quality_events = getattr(self, "quality_events", collections.deque(maxlen=50))
+            self.quality_events.append({"at": now, "kind": "recovered"})
+            self.recovered_at = now          # 供引擎下一轮立即补采新鲜满血 state
 
     def open_socket(self, dst_host, dst_port, timeout) -> socket.socket:
         if self.kind == "direct":
@@ -673,11 +688,15 @@ class Session:
         self.fail_rounds = 0           # 连续未采到合格 state 的轮数（指数退避）
         self.state_healthy = True      # 当前 state 是否采集自满血出口
         self.next_keepalive = 0.0      # 保活下一次触发时间
+        self.degraded_rounds = 0       # 连续综合降智的轮数（升级自愈用）
+        self.obs_reason_ema = None     # 注入请求 reasoning tokens 指数均值基线
+        self.obs_samples = 0
+        self.last_autocheck = 0.0      # 观测触发自动体检的节流
 
 
 KEEPALIVE_DEFAULT = 600       # 保活间隔（秒）
 PROBE_DAILY_LIMIT = 200       # 每日探针请求上限（防失控烧额度）
-DEGRADED_RETRY = 300          # 出口降智后的自愈重试间隔（上游裁决窗口为分钟级）
+DEGRADED_RETRY = 240          # 出口降智后的自愈重试间隔（对齐社区观察的 ~240s 凭据窗口）
 
 
 class Engine:
@@ -695,6 +714,7 @@ class Engine:
         self.tz_overrides = 0         # 已改写的请求数
         self.attribution_state = {"running": False, "started": 0, "finished": 0,
                                   "result": None, "error": ""}
+        self.heal_events = collections.deque(maxlen=50)   # detected/recovered 事件流
         self.started_at = time.time()
         self.stop = threading.Event()
         self.observations = collections.deque(maxlen=300)
@@ -729,6 +749,19 @@ class Engine:
                 f.write(json.dumps(entry, ensure_ascii=False) + "\n")
         except Exception:
             pass
+
+    def heal_summary(self):
+        detected = recovered = 0
+        last = None
+        for e in self.egresses:
+            for ev in getattr(e, "quality_events", []) or []:
+                if ev["kind"] == "detected":
+                    detected += 1
+                elif ev["kind"] == "recovered":
+                    recovered += 1
+                last = ev
+        return {"detected": detected, "recovered": recovered,
+                "last": last, "note": "detected=降智检出次数，recovered=自动恢复次数"}
 
     def observations_summary(self):
         groups = {"on": [], "off": []}
@@ -939,7 +972,7 @@ class Engine:
                 return {"ok": False, "status": resp.status, "result": "invalid_state_envelope"}
             single = judge_quality(answer)
             combined = egress.record_quality(single)
-            egress.quality_answer = answer[:60]
+            egress.quality_answer = f"单次{QUALITY_LABELS.get(single, single)}·{answer[:48]}"
             return {"ok": True, "status": 200, "state": st,
                     "shape_ok": st.blocks in self.blocks_for(sess), "blocks": st.blocks,
                     "quality": single, "combined_quality": combined}
@@ -982,8 +1015,9 @@ class Engine:
         else:
             egress.record_quality("degraded", src="attribution")
             egress.quality_answer = f"归因 {res['prediction']} {res['probability']:.0%}"
-            sess.store.clear()
-            sess.state_healthy = False
+            if sess.state_egress == egress.id:
+                sess.store.clear()
+                sess.state_healthy = False
             sess.last_probe_result = "attribution_mismatch"
             sess.next_probe = min(sess.next_probe, time.time() + DEGRADED_RETRY)
             log("attribution_finished", egress=egress.id, prediction=res["prediction"],
@@ -1007,12 +1041,19 @@ class Engine:
             limit = min(MAX_PROBES_PER_ROUND, len(self.egresses))
             attempts = 0
             accepted = False
+            # 出口绑定策略：常规采集固定用 state 绑定出口（链路一致，避免出口
+            # 跳变）；仅当连续两轮综合降智（升级路径）才轮换到下一个出口
+            bound = self.egress_by_id(sess.state_egress)
+            preferred = bound if (bound and sess.degraded_rounds < 2) else None
             for _ in range(len(self.egresses)):
                 if attempts >= limit or self.stop.is_set():
                     break
-                idx = sess.egress_cursor % len(self.egresses)
-                sess.egress_cursor += 1
-                egress = self.egresses[idx]
+                if preferred is not None:
+                    egress = preferred
+                else:
+                    idx = sess.egress_cursor % len(self.egresses)
+                    sess.egress_cursor += 1
+                    egress = self.egresses[idx]
                 if self._probe_budget_exceeded():
                     log("probe_skipped", level="warn", detail="已达每日探针上限，防额度失控")
                     return
@@ -1027,6 +1068,7 @@ class Engine:
                     combined = r.get("combined_quality", egress.quality)
                     if r["shape_ok"] and r.get("quality") == "healthy" and \
                             combined not in ("degraded", "severely"):
+                        sess.degraded_rounds = 0
                         sess.store.offer(r["state"])
                         sess.state_egress = egress.id
                         sess.state_healthy = True
@@ -1050,16 +1092,30 @@ class Engine:
                         self.save()
                         return
                     if r["shape_ok"] and combined in ("degraded", "severely"):
-                        # 综合判定（多数票）降智：丢弃可能被污染的 state，
-                        # 短退避后同出口自愈重试；单次降智不立刻定性
-                        sess.store.clear()
-                        sess.state_healthy = False
+                        # 综合判定（多数票）降智：仅隔离"本出口"采集的 state——
+                        # 其他出口的满血 state 与本出口的降智无关，不清、不跳出口
+                        if sess.state_egress == egress.id:
+                            sess.store.clear()
+                            sess.state_healthy = False
+                        else:
+                            log("probe_finished", egress=egress.id,
+                                result="other_egress_degraded",
+                                detail="该出口降智但不影响绑定出口的 state，跳过")
                         sess.last_probe_result = "quality_" + combined
+                        if sess.state_egress == egress.id or not sess.store.active:
+                            sess.degraded_rounds += 1
+                            if sess.degraded_rounds >= 2 and len(self.egresses) > 1:
+                                sess.egress_cursor += 1   # 升级：下一轮换出口
+                                log("probe_finished", egress=egress.id,
+                                    result="degraded_escalated",
+                                    rounds=sess.degraded_rounds,
+                                    detail="同出口连续降智，下一轮自动尝试备用出口")
+                                return
                         log("probe_finished", egress=egress.id,
                             result="degraded_state_discarded",
                             quality=r.get("quality"), combined=combined,
                             answer=egress.quality_answer,
-                            detail="多数表决为降智，已清空 state 池，同出口自愈重试")
+                            detail="多数表决为降智，同出口自愈重试")
                         return
                     sess.observed_blocks = r["blocks"]
                     sess.last_probe_result = "shape_mismatch"
@@ -1099,6 +1155,20 @@ class Engine:
             self.probe_date = today
             self.probes_today = 0
         return self.probes_today >= PROBE_DAILY_LIMIT
+
+    def autocheck(self, sess: Session):
+        """观测异常后的确认体检：对 state 绑定出口连跑两题记票。消耗真实额度。"""
+        egress = self.egress_by_id(sess.state_egress) or self.default_egress()
+        for q in QUALITY_PROBES:
+            r = self.probe_once(sess, egress, prompt=q)
+            log("autocheck", egress=egress.id, ok=r.get("ok"),
+                quality=egress.quality, answer=egress.quality_answer)
+            if not r.get("ok") and r.get("status") in (401, 403, 429):
+                return
+        if egress.quality in ("degraded", "severely") and sess.state_egress == egress.id:
+            sess.store.clear()
+            sess.state_healthy = False
+            log("autocheck_isolated", egress=egress.id, detail="确认降智（绑定出口），已清池自愈")
 
     def bootstrap_from_auth(self):
         """增强点：直接从 auth.json 建立会话并采集，无需先在 Codex 发消息。"""
@@ -1161,6 +1231,12 @@ class Engine:
                     need = sess.store.needs_refresh(now) or not sess.state_healthy
                     if keepalive_on and now >= sess.next_keepalive:
                         need = True
+                    # 刚从降智恢复：立即补采满血 state，不受探测冷却限制
+                    recovered_recently = any(
+                        now - getattr(e, "recovered_at", 0) < 30 for e in self.egresses)
+                    if recovered_recently and sess.store.active is None:
+                        sess.next_probe = 0
+                        need = True
                     if not need:
                         continue
                     self.refresh(sess)
@@ -1213,6 +1289,7 @@ class Engine:
                 "daily_limit": PROBE_DAILY_LIMIT,
             },
             "attribution": self.attribution_state,
+            "heal": self.heal_summary(),
             "timezone": {
                 "mode": self.settings.get("tz_mode", "off"),
                 "value": self.settings.get("tz_value", ""),
@@ -1564,15 +1641,20 @@ class Gateway(BaseHTTPRequestHandler):
                     for i, q in enumerate(QUALITY_PROBES):
                         r = eng.probe_once(sess, e, prompt=q)
                         log("egress_quality", egress=e.id, round=i + 1,
-                            ok=r.get("ok"), quality=e.quality, answer=e.quality_answer)
+                            ok=r.get("ok"), single=r.get("quality"),
+                            combined=e.quality, answer=e.quality_answer)
                         if not r.get("ok") and r.get("status") in (401, 403, 429):
                             return
                     if e.quality in ("degraded", "severely"):
-                        sess.store.clear()
-                        sess.state_healthy = False
-                        sess.next_probe = min(sess.next_probe, time.time() + DEGRADED_RETRY)
-                        log("egress_quality_isolated", egress=e.id,
-                            detail="体检综合判定降智，已清池自愈")
+                        if sess.state_egress == e.id:
+                            sess.store.clear()
+                            sess.state_healthy = False
+                            sess.next_probe = min(sess.next_probe, time.time() + DEGRADED_RETRY)
+                            log("egress_quality_isolated", egress=e.id,
+                                detail="体检综合判定降智（绑定出口），已清池自愈")
+                        else:
+                            log("egress_quality_noted", egress=e.id,
+                                detail="该出口降智，但 state 绑定其他出口，无需隔离")
                 eng.save()
             threading.Thread(target=_check_all, daemon=True).start()
             self._json({"ok": True})
@@ -1642,23 +1724,26 @@ class Gateway(BaseHTTPRequestHandler):
 
     # ---- 请求体 ----
     def _read_body(self):
+        """返回 (raw, decoded, err)：raw 为原始字节（含压缩），decoded 为解压副本。
+        转发默认用 raw（与 Codex 直连零差异），decoded 仅用于内容检查与改写。"""
         enc = (self.headers.get("Content-Encoding") or "").lower()
         length = int(self.headers.get("Content-Length") or 0)
         if length > MAX_BODY_BYTES:
-            return None, "request_too_large"
-        body = self.rfile.read(length) if length else b""
-        if enc in ("gzip", "x-gzip") and body:
-            body = gzip.decompress(body)
-        elif enc == "deflate" and body:
-            body = zlib.decompress(body)
-        elif enc == "zstd" and body:
+            return None, None, "request_too_large"
+        raw = self.rfile.read(length) if length else b""
+        body = raw
+        if enc in ("gzip", "x-gzip") and raw:
+            body = gzip.decompress(raw)
+        elif enc == "deflate" and raw:
+            body = zlib.decompress(raw)
+        elif enc == "zstd" and raw:
             if _zstd is None:
-                return None, "zstd_unsupported"
+                return None, None, "zstd_unsupported"
             try:
-                body = _zstd.decompress(body)
+                body = _zstd.decompress(raw)
             except Exception:
-                body = _zstd.ZstdDecompressor().decompressobj().decompress(body)
-        return body, None
+                body = _zstd.ZstdDecompressor().decompressobj().decompress(raw)
+        return raw, body, None
 
     # ---- 核心代理 ----
     def _proxy(self):
@@ -1675,11 +1760,12 @@ class Gateway(BaseHTTPRequestHandler):
             return
 
         eng.requests_total += 1
-        body, body_err = (None, None)
+        raw, body, body_err = (None, None, None)
+        forward_body = None          # None = 尚未决定；默认转发 raw（零差异保真）
         compact = False
         model = eng.settings.get("model") or DEFAULT_MODEL
         if self.command == "POST":
-            body, body_err = self._read_body()
+            raw, body, body_err = self._read_body()
             if body_err:
                 self._fail(415 if body_err != "request_too_large" else 413,
                            body_err, "请求体无法解码（编码不受支持或超过 64 MiB）。")
@@ -1705,6 +1791,7 @@ class Gateway(BaseHTTPRequestHandler):
                         target = eng.settings["tz_value"].encode()
                         body = re.sub(rb"<timezone>[^<]{1,64}</timezone>",
                                       b"<timezone>" + target + b"</timezone>", body)
+                        forward_body = body       # 改写后以 identity 转发
                         eng.tz_overrides += 1
 
         sess, err = eng.borrow(self.headers, model)
@@ -1744,14 +1831,25 @@ class Gateway(BaseHTTPRequestHandler):
             egress = eng.default_egress()
 
         out_headers = {}
+        # 请求保真：除逐跳头与分帧头外全部透传（含 Cookie / Accept-Encoding），
+        # 让上游视角与 Codex 直连一致，不引入本地工具特征
         skip = {"connection", "proxy-connection", "keep-alive", "transfer-encoding", "te",
-                "upgrade", "proxy-authorization", "host", "content-length", "content-encoding",
-                "cookie", "accept-encoding"}
+                "upgrade", "proxy-authorization", "host", "content-length"}
         for k, v in self.headers.items():
             if k.lower() not in skip:
                 out_headers[k] = v
         out_headers["Content-Type"] = self.headers.get("Content-Type") or "application/json"
-        out_headers["Accept-Encoding"] = "identity"
+        if self.command == "POST":
+            if forward_body is None:
+                # 转发原始字节：配套透传原 Content-Encoding，与直连零差异
+                forward_body = raw or b""
+                if self.headers.get("Content-Encoding"):
+                    out_headers["Content-Encoding"] = self.headers["Content-Encoding"]
+                else:
+                    out_headers.pop("Content-Encoding", None)
+            else:
+                # 时区改写路径：以 identity 发送改写后的明文
+                out_headers.pop("Content-Encoding", None)
         if inject and used:
             out_headers[STATE_HEADER] = used.value
 
@@ -1762,7 +1860,7 @@ class Gateway(BaseHTTPRequestHandler):
             if self.command == "GET":
                 conn.request("GET", upath, headers=out_headers)
             else:
-                conn.request("POST", upath, body=body or b"", headers=out_headers)
+                conn.request("POST", upath, body=forward_body or b"", headers=out_headers)
             resp = conn.getresponse()
         except OSError as e:
             egress.last_error = str(e)[:120]
@@ -1797,6 +1895,28 @@ class Gateway(BaseHTTPRequestHandler):
         self.end_headers()
 
         observer = StreamObserver() if (generation and not compact) else None
+        if resp.status >= 400:
+            # 错误响应体很小（JSON），读全记日志用于诊断（不含凭据）
+            err_body = resp.read(8192)
+            log("upstream_error_body", status=resp.status,
+                model=model, inject=inject,
+                detail=err_body[:400].decode("utf8", "replace"))
+            self.send_response(resp.status)
+            for k, v in resp.headers.items():
+                lk = k.lower()
+                if lk in ("connection", "keep-alive", "transfer-encoding",
+                          "proxy-authenticate", "te", "upgrade", "content-length"):
+                    continue
+                self.send_header(k, v)
+            self.send_header("Content-Length", str(len(err_body)))
+            self.end_headers()
+            self.wfile.write(err_body)
+            duration_ms = int((time.time() - started) * 1000)
+            if observer is not None:
+                eng.record_observation(inject, observer, resp.status, model, duration_ms)
+            log("request_finished", status=resp.status, model=model, compact=compact,
+                inject=inject, egress=egress.id, ms=duration_ms)
+            return
         try:
             while True:
                 chunk = resp.read1(65536)
@@ -1817,6 +1937,23 @@ class Gateway(BaseHTTPRequestHandler):
         duration_ms = int((time.time() - started) * 1000)
         if observer is not None:
             eng.record_observation(inject, observer, resp.status, model, duration_ms)
+            # 观测驱动自愈：注入请求的 reasoning tokens 相对基线骤降（<40%）时
+            # 自动触发两题确认体检（节流 10 分钟；样本不足 3 次不判定）
+            if inject and observer.usage.get("reason"):
+                r_tok = observer.usage["reason"]
+                if sess.obs_reason_ema is None:
+                    sess.obs_reason_ema = float(r_tok)
+                    sess.obs_samples = 1
+                else:
+                    sess.obs_samples += 1
+                    sess.obs_reason_ema = 0.7 * sess.obs_reason_ema + 0.3 * r_tok
+                if (sess.obs_samples >= 3 and r_tok < 0.4 * sess.obs_reason_ema
+                        and time.time() - sess.last_autocheck > 600):
+                    sess.last_autocheck = time.time()
+                    log("observation_anomaly", model=model,
+                        reason_tokens=r_tok, baseline=int(sess.obs_reason_ema),
+                        detail="推理深度骤降，自动触发出口体检")
+                    threading.Thread(target=eng.autocheck, args=(sess,), daemon=True).start()
         if inject and used and 200 <= resp.status < 300:
             if sess.store.observe(resp_state, used):
                 log("state_strike", detail="响应 state 形状异常，已计数并切换备用；响应体未销毁")

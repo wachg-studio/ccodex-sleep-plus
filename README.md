@@ -43,6 +43,22 @@ Codex 降智检测与自愈的本地常驻工具：出口质量体检、满血 s
 - 注入窗口可能只有约 240 秒（同上）；`response.created.model` 字段可能失真，token 用量更可靠
 - 质量探针方法来自 [csss](https://github.com/tzf1003/csss)；跨会话缓存思路参考 [CheckClaude](https://github.com/zzusec/CheckClaude)
 
+## 请求保真与边界
+
+为降低"被上游识别为经过本地工具"的风险，网关按**零差异保真**转发：
+
+- 请求体**原始字节透传**（Codex 发来的压缩体原样转发，配套 Content-Encoding 头不变）
+- `Accept-Encoding`、`Cookie` 等头原样透传，不做任何重写（时区归一化开启时除外——该场景以 identity 发送改写后的明文）
+- 除逐跳头（Connection/Transfer-Encoding 等 HTTP 分帧必需）外不增删任何头
+
+**无法消除的差异（如实告知）**：本工具用 Python 标准库发起上游连接，TLS 指纹（JA3/JA4）与 HTTP/1.1（无 ALPN h2）和 Codex 原生 Rust 客户端不同。若上游做客户端 TLS 指纹检测，这层差异可被观测到——这是选择纯标准库实现的代价，我们不做伪装。注入 `X-Codex-Turn-State` 头本身也属非预期使用，风险自担（见上）。
+
+## 自愈策略（三层）
+
+1. **检测层**：双表述知识探针（滚动多数表决，单次不定性）+ ModelTrace 深度归因（终审）+ 观测驱动（注入请求推理深度相对基线骤降时自动触发确认体检）
+2. **恢复层**：降智即清空污染 state 池，约 5 分钟同出口自愈重试（上游裁决窗口为分钟级）
+3. **升级层**：同出口连续两轮降智未恢复 → 自动换备用出口尝试；恢复即回正常循环。全过程面板统计（检出/恢复次数）
+
 ## 机制与边界
 
 - 只处理 Responses HTTP/SSE；不支持 WebSocket
