@@ -1066,8 +1066,9 @@ class Engine:
                     egress.uses += 1
                     egress.last_error = ""
                     combined = r.get("combined_quality", egress.quality)
-                    if r["shape_ok"] and r.get("quality") == "healthy" and \
-                            combined not in ("degraded", "severely"):
+                    if r["shape_ok"] and r.get("quality") == "healthy":
+                        # 单次满血 = 此刻该出口 serving 满血的直接证据：无条件入池，
+                        # 不被旧降智票压着（旧票描述过去，本票描述现在）
                         sess.degraded_rounds = 0
                         sess.store.offer(r["state"])
                         sess.state_egress = egress.id
@@ -1076,7 +1077,7 @@ class Engine:
                         sess.observed_blocks = r["blocks"]
                         accepted = True
                         log("probe_finished", egress=egress.id, result="accepted",
-                            quality=r.get("quality"), combined=combined,
+                            quality="healthy", combined=combined,
                             blocks=r["blocks"], expected=sorted(self.blocks_for(sess)))
                         self.save()
                         return
@@ -1091,7 +1092,8 @@ class Engine:
                             blocks=r["blocks"])
                         self.save()
                         return
-                    if r["shape_ok"] and combined in ("degraded", "severely"):
+                    if r["shape_ok"] and r.get("quality") in ("degraded", "severely") \
+                            and combined in ("degraded", "severely"):
                         # 综合判定（多数票）降智：仅隔离"本出口"采集的 state——
                         # 其他出口的满血 state 与本出口的降智无关，不清、不跳出口
                         if sess.state_egress == egress.id:

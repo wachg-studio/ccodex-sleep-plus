@@ -314,12 +314,30 @@ def run_healing_test():
     check("state marked unhealthy", sess.state_healthy is False)
     check("degraded retry short (self-heal)", sess.next_probe - time.time() <= sp.DEGRADED_RETRY + 5)
     check("keepalive defaults", engine.settings.get("keepalive_interval", sp.KEEPALIVE_DEFAULT) >= 240)
+    # 单次满血优先：旧降智票压着综合判定时，单次满血仍入池不丢 state
+    engine2 = sp.Engine({"injection_enabled": True, "fallback": "passthrough",
+                         "account_mode": "auto", "model": "gpt-6-astra"}, sp.Persist())
+    engine2.egresses = [HTTPEgress("mock", "mock-upstream", "direct", "127.0.0.1", MOCK_PORT)]
+    sess2, _ = engine2.borrow({"Authorization": "Bearer h2-token-123456",
+                               "chatgpt-account-id": "h2"}, "gpt-6-astra")
+    sess2.state_egress = "mock"
+    MOCK_ANSWER = "iPhone 16e"        # 两轮降智，建立综合 degraded
+    engine2.refresh(sess2, manual=True)
+    engine2.refresh(sess2, manual=True)
+    check("setup degraded majority", engine2.egresses[0].quality == "degraded")
+    MOCK_ANSWER = "iPhone 17 Pro"     # 单次满血：必须入池，不能被旧票压住丢掉
+    engine2.refresh(sess2, manual=True)
+    check("single healthy keeps state under old votes",
+          sess2.store.acquire(time.time()) is not None and sess2.state_healthy is True)
+    engine2.egresses.clear()          # 防止引擎线程引用
+
     # 归因终审：覆盖滚动表决历史
     engine.egresses[0].record_quality("healthy", src="attribution")
     check("attribution verdict overrides", engine.egresses[0].quality == "healthy"
           and len(engine.egresses[0].quality_history) == 1)
 
     # 自愈升级：同出口连续两轮综合降智后，下一轮自动换出口
+    MOCK_ANSWER = "iPhone 16e"        # 重置为降智答案
     engine.egresses.append(HTTPEgress("mock2", "mock-upstream-2", "direct", "127.0.0.1", MOCK_PORT))
     sess.degraded_rounds = 2
     engine.refresh(sess, manual=True)   # 第 3 次降智 → 升级换出口
