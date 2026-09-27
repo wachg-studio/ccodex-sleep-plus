@@ -297,11 +297,19 @@ def run_healing_test():
     check("state marked healthy", sess.state_healthy is True)
 
     MOCK_ANSWER = "iPhone 16e"
-    engine.refresh(sess, manual=True)
-    check("degraded probe clears pool", sess.store.acquire(time.time()) is None)
+    engine.refresh(sess, manual=True)   # 第 1 次降智：只记票，不清池
+    check("first degraded vote does not clear pool",
+          sess.store.acquire(time.time()) is not None)
+    check("votes recorded (healthy + degraded)", len(engine.egresses[0].quality_history) == 2)
+    engine.refresh(sess, manual=True)   # 第 2 次降智：多数表决成立 → 清池自愈
+    check("degraded majority clears pool", sess.store.acquire(time.time()) is None)
     check("state marked unhealthy", sess.state_healthy is False)
     check("degraded retry short (self-heal)", sess.next_probe - time.time() <= sp.DEGRADED_RETRY + 5)
     check("keepalive defaults", engine.settings.get("keepalive_interval", sp.KEEPALIVE_DEFAULT) >= 240)
+    # 归因终审：覆盖滚动表决历史
+    engine.egresses[0].record_quality("healthy", src="attribution")
+    check("attribution verdict overrides", engine.egresses[0].quality == "healthy"
+          and len(engine.egresses[0].quality_history) == 1)
     upstream.shutdown()
 
 

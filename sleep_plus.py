@@ -286,9 +286,28 @@ class Egress:
         self.last_ok = 0.0
         self.last_error = ""
         self.uses = 0
-        self.quality = "unknown"      # healthy / degraded / severely / unknown
+        self.quality = "unknown"      # 综合判定（多数表决结果）
         self.quality_answer = ""
+        self.quality_history = []     # 最近 3 次单次判定 [{"q","at","src"}]
         self.attribution = None       # ModelTrace 深度归因结果
+
+    def record_quality(self, single: str, src: str = "probe") -> str:
+        """滚动窗口多数表决：最近 3 次中 2 票一致才定性；单次 unknown 不投票。
+        深度归因 (src=attribution) 为终审，直接覆盖历史。返回综合判定。"""
+        now = int(time.time())
+        if src == "attribution":
+            self.quality_history = [{"q": single, "at": now, "src": "attribution"}]
+            self.quality = single
+            return self.quality
+        if single and single != "unknown":
+            self.quality_history.append({"q": single, "at": now, "src": src})
+            self.quality_history = self.quality_history[-3:]
+        votes = [h["q"] for h in self.quality_history]
+        if votes:
+            counts = {v: votes.count(v) for v in set(votes)}
+            best, n = max(counts.items(), key=lambda kv: kv[1])
+            self.quality = best if (n >= 2 or len(votes) == 1 and len(self.quality_history) == 1) else "unknown"
+        return self.quality
 
     def open_socket(self, dst_host, dst_port, timeout) -> socket.socket:
         if self.kind == "direct":
@@ -378,6 +397,7 @@ class Egress:
             "last_ok": int(self.last_ok), "last_error": self.last_error,
             "uses": self.uses, "quality": self.quality,
             "quality_answer": self.quality_answer,
+            "quality_history": list(self.quality_history),
             "attribution": self.attribution,
         }
 
@@ -540,10 +560,19 @@ class StreamObserver:
 
 # 知识新鲜度探针（社区共识做法，来自 tzf1003/csss：答 iPhone 17 = 满血，
 # iPhone 16 = 降智，iPhone 15 = 严重降智。规则会随时间过时，随社区更新。）
-QUALITY_PROBE_ASK = "What is the latest iPhone model? Reply with just the model name."
+# 单题噪声大（幻觉/表述敏感），所以：①同一知识准备两种表述，保活轮换、体检复测；
+# ②判定进滚动窗口多数表决（见 Egress.record_quality），单次异常不定性。
+QUALITY_PROBES = [
+    "What is the latest iPhone model? Reply with just the model name.",
+    "If I walked into a store today to buy the newest iPhone, which model would I get? Name only the model.",
+]
 QUALITY_PROBE_SYSTEM = ("Answer from your own knowledge only, in a few words, no explanation. "
                         "Do not use any tools or web search.")
 QUALITY_LABELS = {"healthy": "满血", "degraded": "降智", "severely": "严重降智", "unknown": "未知"}
+
+
+def pick_probe(rng=None):
+    return (rng or __import__("random")).choice(QUALITY_PROBES)
 
 
 def sse_answer_text(data: bytes) -> str:
@@ -566,8 +595,11 @@ def sse_answer_text(data: bytes) -> str:
 
 
 def judge_quality(answer: str) -> str:
-    t = (answer or "").lower().replace(" ", "")
-    if "iphone17" in t or "17" in t and "iphone" in t:
+    # 全角数字归一化（csss 细节：中文模型可能输出 １７）
+    t = (answer or "")
+    t = "".join(chr(ord(ch) - 0xFEE0) if "０" <= ch <= "９" else ch for ch in t)
+    t = t.lower().replace(" ", "").replace("-", "").replace("‑", "").replace("–", "").replace("—", "")
+    if "iphone17" in t or ("17" in t and "iphone" in t):
         return "healthy"
     if "iphone16" in t or ("16" in t and "iphone" in t):
         return "degraded"
@@ -865,9 +897,9 @@ class Engine:
             except Exception:
                 pass
 
-    def probe_once(self, sess: Session, egress: Egress):
+    def probe_once(self, sess: Session, egress: Egress, prompt: str = ""):
         """发一条极短的知识探针请求：一次请求同时采集 turn-state 并判定出口
-        serving 质量（社区 csss 项目的 iPhone 知识新鲜度法）。消耗真实额度。"""
+        serving 质量（iPhone 知识新鲜度法，多表述题库随机轮换）。消耗真实额度。"""
         headers = dict(sess.headers)
         headers["Content-Type"] = "application/json"
         headers["Accept"] = "text/event-stream"
@@ -875,7 +907,7 @@ class Engine:
             "model": sess.model,
             "instructions": QUALITY_PROBE_SYSTEM,
             "input": [{"type": "message", "role": "user",
-                       "content": [{"type": "input_text", "text": QUALITY_PROBE_ASK}]}],
+                       "content": [{"type": "input_text", "text": prompt or pick_probe()}]}],
             "stream": True, "store": False, "parallel_tool_calls": True,
             "include": ["reasoning.encrypted_content"],
         }).encode()
@@ -905,11 +937,12 @@ class Engine:
                 return {"ok": False, "status": resp.status, "result": "missing_state_header"}
             if st is None:
                 return {"ok": False, "status": resp.status, "result": "invalid_state_envelope"}
-            egress.quality = judge_quality(answer)
+            single = judge_quality(answer)
+            combined = egress.record_quality(single)
             egress.quality_answer = answer[:60]
             return {"ok": True, "status": 200, "state": st,
                     "shape_ok": st.blocks in self.blocks_for(sess), "blocks": st.blocks,
-                    "quality": egress.quality}
+                    "quality": single, "combined_quality": combined}
         except OSError as e:
             return {"ok": False, "status": 0, "result": "network_failed", "error": str(e)}
         finally:
@@ -940,14 +973,14 @@ class Engine:
             "top": [{"model": r["model"], "p": round(r["probability"], 3)} for r in res["results"][:3]],
             "at": int(time.time()),
         }
-        # 归因结论联动质量判定与自愈
+        # 归因结论联动质量判定与自愈（终审：覆盖滚动表决历史）
         if res["prediction"] == sess.model:
-            egress.quality = "healthy"
+            egress.record_quality("healthy", src="attribution")
             egress.quality_answer = f"归因 {res['prediction']} {res['probability']:.0%}"
             log("attribution_finished", egress=egress.id, prediction=res["prediction"],
                 probability=round(res["probability"], 3), verdict="match")
         else:
-            egress.quality = "degraded"
+            egress.record_quality("degraded", src="attribution")
             egress.quality_answer = f"归因 {res['prediction']} {res['probability']:.0%}"
             sess.store.clear()
             sess.state_healthy = False
@@ -991,30 +1024,42 @@ class Engine:
                     egress.last_ok = time.time()
                     egress.uses += 1
                     egress.last_error = ""
-                    if r["shape_ok"] and r.get("quality") in ("healthy", "unknown"):
-                        # 满血（或无法判定）才入库；unknown 保守按可用
+                    combined = r.get("combined_quality", egress.quality)
+                    if r["shape_ok"] and r.get("quality") == "healthy" and \
+                            combined not in ("degraded", "severely"):
                         sess.store.offer(r["state"])
                         sess.state_egress = egress.id
-                        sess.state_healthy = r.get("quality") == "healthy"
-                        sess.last_probe_result = "accepted" + (
-                            "" if sess.state_healthy else "(质量未知)")
+                        sess.state_healthy = True
+                        sess.last_probe_result = "accepted"
                         sess.observed_blocks = r["blocks"]
                         accepted = True
                         log("probe_finished", egress=egress.id, result="accepted",
-                            quality=r.get("quality"),
+                            quality=r.get("quality"), combined=combined,
                             blocks=r["blocks"], expected=sorted(self.blocks_for(sess)))
                         self.save()
                         return
-                    if r["shape_ok"] and r.get("quality") in ("degraded", "severely"):
-                        # 出口降智：丢弃可能被污染的 state（注入会延续降智链路），
-                        # 短退避后同出口自愈重试（上游裁决窗口为分钟级）
+                    if r["shape_ok"] and r.get("quality") == "unknown" and \
+                            combined not in ("degraded", "severely"):
+                        sess.store.offer(r["state"])
+                        sess.state_egress = egress.id
+                        sess.last_probe_result = "accepted(质量未知)"
+                        accepted = True
+                        log("probe_finished", egress=egress.id, result="accepted",
+                            quality="unknown", combined=combined,
+                            blocks=r["blocks"])
+                        self.save()
+                        return
+                    if r["shape_ok"] and combined in ("degraded", "severely"):
+                        # 综合判定（多数票）降智：丢弃可能被污染的 state，
+                        # 短退避后同出口自愈重试；单次降智不立刻定性
                         sess.store.clear()
                         sess.state_healthy = False
-                        sess.last_probe_result = "quality_" + r["quality"]
+                        sess.last_probe_result = "quality_" + combined
                         log("probe_finished", egress=egress.id,
                             result="degraded_state_discarded",
-                            quality=r.get("quality"), answer=egress.quality_answer,
-                            detail="已清空 state 池，将在冷却后同出口自愈重试")
+                            quality=r.get("quality"), combined=combined,
+                            answer=egress.quality_answer,
+                            detail="多数表决为降智，已清空 state 池，同出口自愈重试")
                         return
                     sess.observed_blocks = r["blocks"]
                     sess.last_probe_result = "shape_mismatch"
@@ -1516,11 +1561,18 @@ class Gateway(BaseHTTPRequestHandler):
 
             def _check_all():
                 for e in eng.egresses:
-                    r = eng.probe_once(sess, e)
-                    log("egress_quality", egress=e.id, ok=r.get("ok"),
-                        quality=e.quality, answer=e.quality_answer)
-                    if r.get("status") in (401, 403, 429):
-                        break
+                    for i, q in enumerate(QUALITY_PROBES):
+                        r = eng.probe_once(sess, e, prompt=q)
+                        log("egress_quality", egress=e.id, round=i + 1,
+                            ok=r.get("ok"), quality=e.quality, answer=e.quality_answer)
+                        if not r.get("ok") and r.get("status") in (401, 403, 429):
+                            return
+                    if e.quality in ("degraded", "severely"):
+                        sess.store.clear()
+                        sess.state_healthy = False
+                        sess.next_probe = min(sess.next_probe, time.time() + DEGRADED_RETRY)
+                        log("egress_quality_isolated", egress=e.id,
+                            detail="体检综合判定降智，已清池自愈")
                 eng.save()
             threading.Thread(target=_check_all, daemon=True).start()
             self._json({"ok": True})

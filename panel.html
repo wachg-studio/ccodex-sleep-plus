@@ -319,7 +319,9 @@ function render(s){
 
   // ---- 出口列表 ----
   const QMAP = {healthy:['满血','ok'], degraded:['降智','err'], severely:['严重降智','err'], unknown:['未测','idle']};
+  const QSHORT = {healthy:'满', degraded:'降', severely:'重', unknown:'?', attribution:'归'};
   $('egresses').innerHTML = eg.map(e=>{
+    const hist = (e.quality_history||[]).map(h => QSHORT[h.src === 'attribution' ? 'attribution' : h.q] || '?');
     const q = QMAP[e.quality] || QMAP.unknown;
     const qtag = e.quality && e.quality !== 'unknown' ? `<span class="tag ${q[1]}">${q[0]}</span>` : '';
     const conn = e.last_error ? '<span class="tag err">连不上</span>'
@@ -327,7 +329,7 @@ function render(s){
     const using = sess && sess.state.usable && e.id === sess.state_egress ? ' <span class="tag use">使用中</span>' : '';
     return `<div class="egress">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M3 12h18"/><path d="M12 3a15 15 0 0 1 0 18 15 15 0 0 1 0-18z"/></svg>
-      <div class="name">${e.label}<small>${e.uses} 次使用${e.quality_answer ? ' · 答过: ' + e.quality_answer : ''}</small></div>
+      <div class="name">${e.label}<small>${e.uses} 次使用${hist.length ? ' · 近' + hist.length + '次: ' + hist.join('·') : ''}${e.quality_answer ? ' · 答: ' + e.quality_answer : ''}</small></div>
       ${qtag}${conn}${using}</div>`;
   }).join('') || '<p style="font-size:13px;color:var(--faint)">未发现网络出口</p>';
 
