@@ -2598,9 +2598,10 @@ def main():
     persist = Persist()
     saved = persist.read()
     settings = saved.get("settings") or {}
-    # 注入默认开启（292-ticket 模式）：只注入 10/12 块且 240s 内的新鲜 state，
-    # 并有"连续 2 次断流自动关闭"的兜底（inject_stream_incomplete）
-    settings.setdefault("injection_enabled", True)
+    # 注入默认禁用（安全优先）：实测上游会拒绝注入的 state 并掐断生成流；
+    # 292-ticket 实验模式保留（仅 10/12 块 + 240s 新鲜度 + 断流自动关闭兜底），
+    # 需在面板手动开启并自担风险。检测/体检/自愈/保真转发不受影响。
+    settings.setdefault("injection_enabled", False)
     settings.setdefault("fallback", "passthrough")
     settings.setdefault("account_mode", "auto")
     settings.setdefault("model", DEFAULT_MODEL)
